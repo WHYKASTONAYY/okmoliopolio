@@ -1,0 +1,5 @@
+python-telegram-bot
+telethon
+pytz
+filetype
+urllib3==1.26.18
