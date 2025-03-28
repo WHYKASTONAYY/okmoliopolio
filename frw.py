@@ -12,6 +12,7 @@ import asyncio
 import traceback
 import time
 import signal
+import random
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -19,7 +20,7 @@ from telegram.ext import (
 )
 from telethon import TelegramClient
 from telethon.tl.types import PeerChannel
-from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from telethon.errors import SessionPasswordNeededError, FloodWaitError, ChatSendMediaForbiddenError
 from telethon.tl.functions.channels import JoinChannelRequest
 from telethon.tl.functions.messages import ImportChatInviteRequest
 import pytz
@@ -40,19 +41,7 @@ sys.modules['imghdr'] = imghdr_module
 
 # Configuration from environment variables with validation
 def load_env_var(name, required=True, cast=str):
-    """Load an environment variable with type casting and validation.
-
-    Args:
-        name (str): The name of the environment variable.
-        required (bool): Whether the variable is mandatory.
-        cast (callable): Function to cast the variable's value.
-
-    Returns:
-        The cast value or None if not required and not set.
-
-    Raises:
-        ValueError: If required and not set.
-    """
+    """Load an environment variable with type casting and validation."""
     value = os.environ.get(name)
     if required and not value:
         raise ValueError(f"Environment variable {name} is not set.")
@@ -131,23 +120,14 @@ translations = {
         'send_to_all_groups': "Send to All Groups",
     },
     # Other languages omitted for brevity; assume they remain as in original
-    'uk': {...},
-    'pl': {...},
-    'lt': {...},
-    'ru': {...}
+    'uk': {},
+    'pl': {},
+    'lt': {},
+    'ru': {}
 }
 
 def get_text(user_id, key, **kwargs):
-    """Retrieve translated text based on user's language preference.
-
-    Args:
-        user_id (int): The user's ID.
-        key (str): The key for the translation.
-        **kwargs: Additional keyword arguments for string formatting.
-
-    Returns:
-        str: The translated and formatted text.
-    """
+    """Retrieve translated text based on user's language preference."""
     with db_lock:
         cursor.execute("SELECT language FROM clients WHERE user_id = ?", (user_id,))
         result = cursor.fetchone()
@@ -326,14 +306,7 @@ async def get_chat_from_link(client, link):
     raise ValueError("Invalid link")
 
 def get_userbot_client(phone_number):
-    """Retrieve or create a TelegramClient instance for a userbot.
-
-    Args:
-        phone_number (str): The phone number of the userbot.
-
-    Returns:
-        tuple: (client, loop, lock) or (None, None, None) if failed.
-    """
+    """Retrieve or create a TelegramClient instance for a userbot."""
     try:
         with db_lock:
             cursor.execute("SELECT api_id, api_hash, session_file FROM userbots WHERE phone_number = ?", (phone_number,))
@@ -467,15 +440,7 @@ async def join_target_groups(client, lock, folder_id, phone):
 
 # Handlers
 def start(update: Update, context):
-    """Handle the /start command to activate the account or show client menu.
-
-    Args:
-        update (Update): The incoming update from Telegram.
-        context: The context object for the handler.
-
-    Returns:
-        int: Conversation state or END.
-    """
+    """Handle the /start command to activate the account or show client menu."""
     try:
         user_id = update.effective_user.id
         logging.info(f"Start command received from user {user_id}")
@@ -1268,7 +1233,7 @@ def get_api_hash(update: Update, context):
             update.message.reply_text("Enter the code sent to your phone:")
             return WAITING_FOR_CODE_USERBOT
     except Exception as e:
-        log_event("Get API Hash Error", f"Phone: {phone}, Error: {e}")  # Corrected typo from log有机会_event
+        log_event("Get API Hash Error", f"Phone: {phone}, Error: {e}")
         update.message.reply_text(f"Error: {e}. Please try again.")
         return ConversationHandler.END
 
@@ -1778,49 +1743,65 @@ async def forward_task(bot, user_id, phone):
                     await asyncio.to_thread(bot.send_message, user_id, f"Task for userbot {display_name} is incomplete or inactive.")
                     return
                 current_time = int(datetime.now(utc_tz).timestamp())
-                interval = repetition_interval * 60
-                if current_time >= start_time:
-                    try:
-                        entity, message_id = await get_message_from_link(client, message_link)
-                    except ValueError as e:
-                        log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Error: Invalid message link - {e}")
+                interval = repetition_interval * 60  # Convert minutes to seconds
+                # Ensure task runs only within a 60-second window of start_time to prevent overlap
+                if not (start_time <= current_time < start_time + 60):
+                    return  # Skip if not within the exact time window
+
+                logging.info(f"Task triggered for user {user_id}, userbot {phone}: current_time={current_time}, start_time={start_time}, interval={interval}")
+
+                try:
+                    entity, message_id = await get_message_from_link(client, message_link)
+                    message = await client.get_messages(entity, ids=message_id)
+                except ValueError as e:
+                    log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Error: Invalid message link - {e}")
+                    with db_lock:
+                        cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
+                        result = cursor.fetchone()
+                        username = result[0] if result and result[0] else None
+                    display_name = f"@{username}" if username else f"{phone} (no username set)"
+                    await asyncio.to_thread(bot.send_message, user_id, f"Invalid message link for userbot {display_name}: {str(e)}")
+                    return
+                if send_to_all_groups:
+                    dialogs = await client.get_dialogs()
+                    groups = [dialog.entity.id for dialog in dialogs if dialog.is_group]
+                    logging.info(f"Forwarding to all {len(groups)} groups for userbot {phone}")
+                else:
+                    if not folder_id:
+                        log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Error: No folder set")
                         with db_lock:
                             cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
                             result = cursor.fetchone()
                             username = result[0] if result and result[0] else None
                         display_name = f"@{username}" if username else f"{phone} (no username set)"
-                        await asyncio.to_thread(bot.send_message, user_id, f"Invalid message link for userbot {display_name}: {str(e)}")
+                        await asyncio.to_thread(bot.send_message, user_id, f"No folder set for userbot {display_name}.")
                         return
-                    if send_to_all_groups:
-                        dialogs = await client.get_dialogs()
-                        groups = [dialog.entity.id for dialog in dialogs if dialog.is_group]
-                        logging.info(f"Forwarding to all {len(groups)} groups for userbot {phone}")
-                    else:
-                        if not folder_id:
-                            log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Error: No folder set")
-                            with db_lock:
-                                cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-                                result = cursor.fetchone()
-                                username = result[0] if result and result[0] else None
-                            display_name = f"@{username}" if username else f"{phone} (no username set)"
-                            await asyncio.to_thread(bot.send_message, user_id, f"No folder set for userbot {display_name}.")
-                            return
-                        with db_lock:
-                            cursor.execute("SELECT group_id FROM target_groups WHERE folder_id = ?", (folder_id,))
-                            groups = [row[0] for row in cursor.fetchall()]
-                        logging.info(f"Forwarding to {len(groups)} groups in folder {folder_id} for userbot {phone}")
-                    if not groups:
-                        log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Error: No target groups")
-                        with db_lock:
-                            cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-                            result = cursor.fetchone()
-                            username = result[0] if result and result[0] else None
-                        display_name = f"@{username}" if username else f"{phone} (no username set)"
-                        await asyncio.to_thread(bot.send_message, user_id, f"No target groups found for userbot {display_name}.")
-                        return
+                    with db_lock:
+                        cursor.execute("SELECT group_id FROM target_groups WHERE folder_id = ?", (folder_id,))
+                        groups = [row[0] for row in cursor.fetchall()]
+                    logging.info(f"Forwarding to {len(groups)} groups in folder {folder_id} for userbot {phone}")
+                if not groups:
+                    log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Error: No target groups")
+                    with db_lock:
+                        cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
+                        result = cursor.fetchone()
+                        username = result[0] if result and result[0] else None
+                    display_name = f"@{username}" if username else f"{phone} (no username set)"
+                    await asyncio.to_thread(bot.send_message, user_id, f"No target groups found for userbot {display_name}.")
+                    return
+
+                successful_groups = 0
+                for group_id in groups:
                     try:
-                        for group_id in groups:
-                            await client.forward_messages(PeerChannel(group_id), message_id, entity)
+                        await client.forward_messages(PeerChannel(group_id), message_id, entity)
+                        successful_groups += 1
+                    except ChatSendMediaForbiddenError:
+                        if message.text:
+                            await client.send_message(PeerChannel(group_id), message.text)
+                            successful_groups += 1
+                            logging.info(f"Sent text-only message to group {group_id} due to media restriction")
+                        else:
+                            logging.warning(f"Message has no text to send to group {group_id}")
                     except FloodWaitError as e:
                         wait_time = e.seconds
                         with db_lock:
@@ -1828,42 +1809,39 @@ async def forward_task(bot, user_id, phone):
                             result = cursor.fetchone()
                             username = result[0] if result and result[0] else None
                         display_name = f"@{username}" if username else f"{phone} (no username set)"
-                        await asyncio.to_thread(bot.send_message, user_id, f"Userbot {display_name} is rate-limited or spam-blocked. Waiting {wait_time} seconds before retrying.")
+                        await asyncio.to_thread(bot.send_message, user_id, f"Userbot {display_name} is rate-limited. Waiting {wait_time} seconds.")
                         await asyncio.sleep(wait_time)
-                        for group_id in groups:
-                            await client.forward_messages(PeerChannel(group_id), message_id, entity)
+                        await client.forward_messages(PeerChannel(group_id), message_id, entity)
+                        successful_groups += 1
                     except Exception as e:
-                        log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Error: {e}")
-                        with db_lock:
-                            cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-                            result = cursor.fetchone()
-                            username = result[0] if result and result[0] else None
-                        display_name = f"@{username}" if username else f"{phone} (no username set)"
-                        await asyncio.to_thread(bot.send_message, user_id, f"Error with userbot {display_name}: {str(e)}. It may be blocked or restricted.")
-                        return
+                        log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Group: {group_id}, Error: {e}")
+                    # Add a small random delay (1-2 seconds) between groups
+                    await asyncio.sleep(random.uniform(1, 2))
 
-                    with db_lock:
-                        cursor.execute("SELECT forwards_count FROM clients WHERE user_id = ?", (user_id,))
-                        result = cursor.fetchone()
-                        forwards_count = result[0] if result else 0
-                        is_first_run = forwards_count == 0
-                        cursor.execute("UPDATE userbot_settings SET start_time = ? WHERE client_id = ? AND userbot_phone = ?",
-                                       (start_time + interval, user_id, phone))
-                        cursor.execute("UPDATE clients SET forwards_count = forwards_count + 1, groups_reached = ?, total_messages_sent = total_messages_sent + ? WHERE user_id = ?",
-                                       (len(groups), len(groups), user_id))
-                        cursor.execute("SELECT total_messages_sent FROM clients WHERE user_id = ?", (user_id,))
-                        result = cursor.fetchone()
-                        total_sent = result[0] if result else 0
-                        cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-                        result = cursor.fetchone()
-                        username = result[0] if result and result[0] else None
-                        db.commit()
-                    display_name = f"@{username}" if username else f"{phone} (no username set)"
-                    if is_first_run:
-                        await asyncio.to_thread(bot.send_message, user_id, f"First round of messages sent by userbot {display_name} to {len(groups)} groups. Total messages sent: {total_sent}")
-                    else:
-                        await asyncio.to_thread(bot.send_message, user_id, f"Messages sent by userbot {display_name} to {len(groups)} groups. Total messages sent: {total_sent}")
-                    log_event("Message Forwarded", f"User: {user_id}, Userbot: {phone}, Groups: {len(groups)}")
+                with db_lock:
+                    cursor.execute("SELECT forwards_count FROM clients WHERE user_id = ?", (user_id,))
+                    result = cursor.fetchone()
+                    forwards_count = result[0] if result else 0
+                    is_first_run = forwards_count == 0
+                    new_start_time = start_time + interval
+                    cursor.execute("UPDATE userbot_settings SET start_time = ? WHERE client_id = ? AND userbot_phone = ?",
+                                   (new_start_time, user_id, phone))
+                    cursor.execute("UPDATE clients SET forwards_count = forwards_count + 1, groups_reached = ?, total_messages_sent = total_messages_sent + ? WHERE user_id = ?",
+                                   (successful_groups, successful_groups, user_id))
+                    cursor.execute("SELECT total_messages_sent FROM clients WHERE user_id = ?", (user_id,))
+                    result = cursor.fetchone()
+                    total_sent = result[0] if result else 0
+                    cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
+                    result = cursor.fetchone()
+                    username = result[0] if result and result[0] else None
+                    db.commit()
+                    logging.info(f"Updated start_time to {new_start_time} for user {user_id}, userbot {phone}")
+                display_name = f"@{username}" if username else f"{phone} (no username set)"
+                if is_first_run:
+                    await asyncio.to_thread(bot.send_message, user_id, f"First round of messages sent by userbot {display_name} to {successful_groups}/{len(groups)} groups. Total messages sent: {total_sent}")
+                else:
+                    await asyncio.to_thread(bot.send_message, user_id, f"Messages sent by userbot {display_name} to {successful_groups}/{len(groups)} groups. Total messages sent: {total_sent}")
+                log_event("Message Forwarded", f"User: {user_id}, Userbot: {phone}, Groups: {successful_groups}/{len(groups)}")
             finally:
                 await client.disconnect()
     except Exception as e:
