@@ -99,10 +99,11 @@ userbots_lock = threading.Lock()
     WAITING_FOR_TARGET_GROUP, WAITING_FOR_FOLDER_CHOICE, WAITING_FOR_FOLDER_NAME,
     WAITING_FOR_FOLDER_SELECTION, TASK_SETUP, WAITING_FOR_LANGUAGE,
     WAITING_FOR_EXTEND_CODE, WAITING_FOR_EXTEND_DAYS,
-    WAITING_FOR_ADD_USERBOTS_CODE, WAITING_FOR_ADD_USERBOTS_COUNT, SELECT_TARGET_GROUPS
-) = range(21)
+    WAITING_FOR_ADD_USERBOTS_CODE, WAITING_FOR_ADD_USERBOTS_COUNT, SELECT_TARGET_GROUPS,
+    WAITING_FOR_USERBOT_SELECTION, WAITING_FOR_GROUP_LINKS, WAITING_FOR_FOLDER_ACTION
+) = range(24)  # Removed unused states
 
-# Translations dictionary (unchanged for brevity)
+# Translations dictionary
 translations = {
     'en': {
         'welcome': "Welcome! To activate your account, please send your invitation code now (e.g., a565ae57).",
@@ -118,8 +119,9 @@ translations = {
         'select_target_groups': "Select Target Groups",
         'select_folder': "Select Folder",
         'send_to_all_groups': "Send to All Groups",
+        'join_target_groups': "Join Target Groups",
+        'logs': "Logs",
     },
-    # Other languages omitted for brevity; assume they remain as in original
     'uk': {},
     'pl': {},
     'lt': {},
@@ -135,7 +137,7 @@ def get_text(user_id, key, **kwargs):
     text = translations.get(lang, translations['en']).get(key, translations['en'].get(key, key))
     return text.format(**kwargs)
 
-# Database initialization (unchanged)
+# Database initialization
 try:
     with db_lock:
         cursor.executescript('''
@@ -294,7 +296,7 @@ async def get_message_from_link(client, link):
 
 async def get_chat_from_link(client, link):
     if link.startswith("https://t.me/+"):
-        updates = await client(ImportChatInviteRequest(link[len("https://t.me/+"):]))
+        updates = await client(ImportChatInviteRequest(link[len("https://t.me/+"):] ))
         return updates.chats[0].id
     elif link.startswith("https://t.me/c/"):
         match = re.search(r'https://t.me/c/(\d+)/\d+', link)
@@ -346,7 +348,8 @@ async def check_membership(client, group_id):
     return False
 
 async def add_and_join_group(client, group_url, folder_id, added_by, phone):
-    max_retries = 3
+    max_retries = 5
+    base_delay = 5  # Initial delay in seconds
     for attempt in range(max_retries):
         try:
             logging.info(f"Attempt {attempt + 1}: Joining group {group_url}")
@@ -388,7 +391,7 @@ async def add_and_join_group(client, group_url, folder_id, added_by, phone):
                     return False, f"Join request pending for {group_name} (ID: {group_id})"
         except FloodWaitError as e:
             if attempt < max_retries - 1:
-                wait_time = e.seconds
+                wait_time = min(e.seconds, 60) + (base_delay * (2 ** attempt))  # Exponential backoff with cap
                 logging.warning(f"Flood wait error on attempt {attempt + 1}: Waiting {wait_time} seconds before retrying...")
                 await asyncio.sleep(wait_time)
                 continue
@@ -396,16 +399,16 @@ async def add_and_join_group(client, group_url, folder_id, added_by, phone):
                 return False, f"Flood wait error after {max_retries} attempts: {str(e)}"
         except Exception as e:
             return False, f"Error joining group: {str(e)}"
-    return False, "Max retries reached. Could not join the group."
+    return False, f"Max retries ({max_retries}) reached. Could not join the group."
 
-async def join_groups(client, urls, folder_id, phone):
+async def join_groups(client, urls, folder_id, phone, added_by):
     semaphore = asyncio.Semaphore(5)
     async def wrapped_add_and_join(url):
         async with semaphore:
             try:
-                return await asyncio.wait_for(add_and_join_group(client, url, folder_id, "admin", phone), timeout=30)
+                return await asyncio.wait_for(add_and_join_group(client, url, folder_id, added_by, phone), timeout=30)
             except asyncio.TimeoutError:
-                return asyncio.TimeoutError()
+                return False, "Timeout - Join operation took too long"
     tasks = [wrapped_add_and_join(url) for url in urls]
     results = await asyncio.gather(*tasks, return_exceptions=True)
     return results
@@ -552,6 +555,8 @@ def client_menu(update: Update, context):
         keyboard = [
             [InlineKeyboardButton(get_text(user_id, 'setup_tasks'), callback_data="client_setup_tasks")],
             [InlineKeyboardButton(get_text(user_id, 'manage_folders'), callback_data="client_manage_folders")],
+            [InlineKeyboardButton(get_text(user_id, 'join_target_groups'), callback_data="client_join_target_groups")],
+            [InlineKeyboardButton(get_text(user_id, 'logs'), callback_data="client_view_logs")],
             [InlineKeyboardButton(get_text(user_id, 'set_language'), callback_data="client_set_language")]
         ]
         markup = InlineKeyboardMarkup(keyboard)
@@ -563,25 +568,127 @@ def client_menu(update: Update, context):
         return ConversationHandler.END
 
 def handle_callback(update: Update, context):
+    """Handle all callback queries from inline keyboards."""
     try:
         query = update.callback_query
         query.answer()
         data = query.data
         user_id = query.from_user.id
 
-        if data == "admin_add_group":
+        if data == "client_join_target_groups":
+            with db_lock:
+                cursor.execute("SELECT dedicated_userbots FROM clients WHERE user_id = ?", (user_id,))
+                result = cursor.fetchone()
+            if result and result[0]:
+                userbot_phones = result[0].split(",")
+                keyboard = [[InlineKeyboardButton("All Userbots", callback_data="join_all_userbots")]]
+                for phone in userbot_phones:
+                    with db_lock:
+                        cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
+                        result = cursor.fetchone()
+                        username = result[0] if result and result[0] else None
+                    display_name = f"@{username}" if username else f"{phone} (no username set)"
+                    keyboard.append([InlineKeyboardButton(display_name, callback_data=f"join_userbot_{phone}")])
+                keyboard.append([InlineKeyboardButton(get_text(user_id, 'back_to_menu'), callback_data="back_to_client_menu")])
+                markup = InlineKeyboardMarkup(keyboard)
+                query.edit_message_text("Select a userbot to join groups:", reply_markup=markup)
+                return WAITING_FOR_USERBOT_SELECTION
+            else:
+                query.edit_message_text("No userbots assigned.")
+                return ConversationHandler.END
+
+        elif data.startswith("join_userbot_") or data == "join_all_userbots":
+            context.user_data['selected_userbot'] = data.split("_")[-1] if data != "join_all_userbots" else "all"
+            keyboard = [[InlineKeyboardButton(get_text(user_id, 'back_to_menu'), callback_data="back_to_client_menu")]]
+            markup = InlineKeyboardMarkup(keyboard)
+            query.edit_message_text("Send the list of group links (one per line):", reply_markup=markup)
+            return WAITING_FOR_GROUP_LINKS
+
+        elif data == "client_view_logs":
+            with db_lock:
+                cursor.execute("SELECT total_messages_sent, groups_reached FROM clients WHERE user_id = ?", (user_id,))
+                result = cursor.fetchone()
+            if result:
+                total_sent, groups_reached = result
+                message = f"**Logs**\nTotal Messages Sent: {total_sent}\nGroups Reached: {groups_reached}"
+                keyboard = [[InlineKeyboardButton(get_text(user_id, 'back_to_menu'), callback_data="back_to_client_menu")]]
+                markup = InlineKeyboardMarkup(keyboard)
+                query.edit_message_text(message, reply_markup=markup)
+            else:
+                query.edit_message_text("No logs available.")
+            return ConversationHandler.END
+
+        elif data == "client_manage_folders":
+            keyboard = [
+                [InlineKeyboardButton("Create New Folder", callback_data="create_new_folder")],
+                [InlineKeyboardButton("Edit Existing Folder", callback_data="edit_existing_folder")],
+                [InlineKeyboardButton(get_text(user_id, 'back_to_menu'), callback_data="back_to_client_menu")]
+            ]
+            markup = InlineKeyboardMarkup(keyboard)
+            query.edit_message_text("Manage Folders:", reply_markup=markup)
+            return WAITING_FOR_FOLDER_ACTION
+
+        elif data == "create_new_folder":
+            keyboard = [[InlineKeyboardButton("Back to Manage Folders", callback_data="client_manage_folders")]]
+            markup = InlineKeyboardMarkup(keyboard)
+            query.edit_message_text("Enter the name for the new folder:", reply_markup=markup)
+            return WAITING_FOR_FOLDER_NAME
+
+        elif data == "edit_existing_folder":
+            with db_lock:
+                cursor.execute("SELECT id, name FROM folders WHERE created_by = ?", (str(user_id),))
+                folders = cursor.fetchall()
+            if not folders:
+                query.edit_message_text("No folders available. Create a new folder first.")
+                return ConversationHandler.END
+            keyboard = [[InlineKeyboardButton(f[1], callback_data=f"edit_folder_{f[0]}")] for f in folders]
+            keyboard.append([InlineKeyboardButton("Back to Manage Folders", callback_data="client_manage_folders")])
+            markup = InlineKeyboardMarkup(keyboard)
+            query.edit_message_text("Select a folder to edit:", reply_markup=markup)
+            return WAITING_FOR_FOLDER_SELECTION
+
+        elif data.startswith("edit_folder_"):
+            folder_id = int(data.split("_")[2])
+            context.user_data['selected_folder_id'] = folder_id
+            with db_lock:
+                cursor.execute("SELECT name FROM folders WHERE id = ?", (folder_id,))
+                result = cursor.fetchone()
+                folder_name = result[0] if result else "Not set"
+                cursor.execute("SELECT group_name FROM target_groups WHERE folder_id = ?", (folder_id,))
+                existing_groups = [row[0] for row in cursor.fetchall()]
+            message = f"Folder: {folder_name}\nExisting groups:\n- " + "\n- ".join(existing_groups) if existing_groups else "No groups in this folder."
+            keyboard = [
+                [InlineKeyboardButton("Update Entire List", callback_data="update_folder_list")],
+                [InlineKeyboardButton("Add New Links", callback_data="add_to_folder_list")],
+                [InlineKeyboardButton("Back to Manage Folders", callback_data="client_manage_folders")]
+            ]
+            markup = InlineKeyboardMarkup(keyboard)
+            query.edit_message_text(message, reply_markup=markup)
+            return WAITING_FOR_FOLDER_ACTION
+
+        elif data in ["update_folder_list", "add_to_folder_list"]:
+            context.user_data['folder_action'] = data
+            keyboard = [[InlineKeyboardButton("Back to Manage Folders", callback_data="client_manage_folders")]]
+            markup = InlineKeyboardMarkup(keyboard)
+            action_text = "update" if data == "update_folder_list" else "add to"
+            query.edit_message_text(f"Send the group links to {action_text} the folder (one per line):", reply_markup=markup)
+            return WAITING_FOR_GROUP_LINKS
+
+        elif data == "admin_add_group":
             keyboard = [
                 [InlineKeyboardButton("Add to Existing Folder", callback_data="add_to_existing")],
-                [InlineKeyboardButton("Create New Folder", callback_data="create_new_folder")],
+                [InlineKeyboardButton("Create New Folder", callback_data="create_new_folder_admin")],
             ]
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Choose an option:", reply_markup=markup)
             return WAITING_FOR_FOLDER_CHOICE
-        elif data == "create_new_folder":
+
+        elif data == "create_new_folder_admin":
             keyboard = [[InlineKeyboardButton("Back to Admin Panel", callback_data="admin_panel")]]
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Enter the name for the new folder:", reply_markup=markup)
             return WAITING_FOR_FOLDER_NAME
+
         elif data == "add_to_existing":
             with db_lock:
                 cursor.execute("SELECT id, name FROM folders WHERE created_by = ?", (str(user_id),))
@@ -593,8 +700,10 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Select a folder:", reply_markup=markup)
             return WAITING_FOR_FOLDER_SELECTION
+
         elif data == "admin_panel":
             return admin_panel(update, context)
+
         elif data.startswith("folder_"):
             folder_id = int(data.split("_")[1])
             with db_lock:
@@ -605,20 +714,19 @@ def handle_callback(update: Update, context):
                 existing_groups = [row[0] for row in cursor.fetchall()]
             context.user_data['folder_id'] = folder_id
             context.user_data['folder_name'] = folder_name
-            if existing_groups:
-                groups_str = "\n- ".join(existing_groups)
-                message = f"Selected folder: {folder_name}\nExisting groups:\n- {groups_str}\n\nEnter additional target group URLs (one per line):"
-            else:
-                message = f"Selected folder: {folder_name}\nNo existing groups.\nEnter target group URLs (one per line):"
+            message = (f"Selected folder: {folder_name}\nExisting groups:\n- " + "\n- ".join(existing_groups) if existing_groups 
+                       else f"Selected folder: {folder_name}\nNo existing groups.") + "\n\nEnter additional target group URLs (one per line):"
             keyboard = [[InlineKeyboardButton("Back to Admin Panel", callback_data="admin_panel")]]
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text(message, reply_markup=markup)
             return WAITING_FOR_GROUP_URLS
+
         elif data == "admin_add_userbot":
             keyboard = [[InlineKeyboardButton("Back to Admin Panel", callback_data="admin_panel")]]
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Enter userbot phone number (e.g., +1234567890):", reply_markup=markup)
             return WAITING_FOR_PHONE
+
         elif data == "admin_remove_userbot":
             with db_lock:
                 cursor.execute("SELECT phone_number, username FROM userbots")
@@ -633,6 +741,7 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Select userbot to remove:", reply_markup=markup)
             return ConversationHandler.END
+
         elif data.startswith("remove_ub_"):
             phone = data.split("_")[2]
             with db_lock:
@@ -652,6 +761,7 @@ def handle_callback(update: Update, context):
             notify_admins(context.bot, f"Userbot {display_name} removed.")
             query.edit_message_text(f"Userbot {display_name} removed.")
             return ConversationHandler.END
+
         elif data == "admin_remove_group":
             with db_lock:
                 cursor.execute("SELECT group_id, group_name FROM target_groups WHERE added_by = ?", (str(user_id),))
@@ -663,6 +773,7 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Select group to remove:", reply_markup=markup)
             return ConversationHandler.END
+
         elif data.startswith("remove_group_"):
             group_id = int(data.split("_")[2])
             with db_lock:
@@ -671,11 +782,13 @@ def handle_callback(update: Update, context):
             log_event("Group Removed", f"Group ID: {group_id}, By: {user_id}")
             query.edit_message_text("Group removed.")
             return ConversationHandler.END
+
         elif data == "admin_generate_invite":
             keyboard = [[InlineKeyboardButton("Back to Admin Panel", callback_data="admin_panel")]]
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Enter subscription details (e.g., 30day 4acc [folder_name]):", reply_markup=markup)
             return WAITING_FOR_SUB_DETAILS
+
         elif data == "admin_view_subs":
             with db_lock:
                 cursor.execute("SELECT user_id, invitation_code, subscription_end, folder_name FROM clients")
@@ -689,6 +802,7 @@ def handle_callback(update: Update, context):
                 msg += f"User {s[0]} | Code: {s[1]} | Ends: {end_date} | Folder: {s[3] or 'None'}\n"
             query.edit_message_text(msg)
             return ConversationHandler.END
+
         elif data == "admin_view_logs":
             with db_lock:
                 cursor.execute("SELECT timestamp, event, details FROM logs ORDER BY timestamp DESC LIMIT 10")
@@ -699,16 +813,19 @@ def handle_callback(update: Update, context):
                 msg += f"{date} | {log[1]} | {log[2]}\n"
             query.edit_message_text(msg)
             return ConversationHandler.END
+
         elif data == "admin_extend_sub":
             keyboard = [[InlineKeyboardButton("Back to Admin Panel", callback_data="admin_panel")]]
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Enter the client's activation code to extend their subscription:", reply_markup=markup)
             return WAITING_FOR_EXTEND_CODE
+
         elif data == "admin_add_userbots":
             keyboard = [[InlineKeyboardButton("Back to Admin Panel", callback_data="admin_panel")]]
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Enter the client's activation code to add more userbots:", reply_markup=markup)
             return WAITING_FOR_ADD_USERBOTS_CODE
+
         elif data == "client_setup_tasks":
             with db_lock:
                 cursor.execute("SELECT dedicated_userbots FROM clients WHERE user_id = ?", (user_id,))
@@ -729,6 +846,7 @@ def handle_callback(update: Update, context):
                 markup = InlineKeyboardMarkup(keyboard)
                 query.edit_message_text(message, reply_markup=markup)
             return ConversationHandler.END
+
         elif data.startswith("edit_task_"):
             phone = data.split("_")[2]
             context.user_data['setting_phone'] = phone
@@ -785,6 +903,7 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text(message, reply_markup=markup)
             return TASK_SETUP
+
         elif data.startswith("select_target_groups_"):
             phone = data.split("_")[3]
             context.user_data['setting_phone'] = phone
@@ -796,6 +915,7 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Choose target groups option:", reply_markup=markup)
             return SELECT_TARGET_GROUPS
+
         elif data.startswith("send_to_all_groups_"):
             phone = data.split("_")[4]
             task_config = context.user_data[f'task_config_{phone}']
@@ -823,6 +943,7 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text(message, reply_markup=markup)
             return TASK_SETUP
+
         elif data.startswith("set_folder_"):
             phone = data.split("_")[2]
             context.user_data['setting_phone'] = phone
@@ -837,6 +958,7 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Select a folder for forwarding:", reply_markup=markup)
             return SELECT_TARGET_GROUPS
+
         elif data.startswith("select_folder_"):
             parts = data.split("_")
             phone, folder_id = parts[2], int(parts[3])
@@ -869,26 +991,23 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text(message, reply_markup=markup)
             return TASK_SETUP
+
         elif data.startswith("set_message_"):
             phone = data.split("_")[2]
             context.user_data['setting_phone'] = phone
             keyboard = [[InlineKeyboardButton("Back to Task Setup", callback_data=f"back_to_task_setup_{phone}")]]
             markup = InlineKeyboardMarkup(keyboard)
-            query.edit_message_text(
-                "Send the message link (e.g., https://t.me/c/123456789/10):",
-                reply_markup=markup
-            )
+            query.edit_message_text("Send the message link (e.g., https://t.me/c/123456789/10):", reply_markup=markup)
             return WAITING_FOR_MESSAGE_LINK
+
         elif data.startswith("set_time_"):
             phone = data.split("_")[2]
             context.user_data['setting_phone'] = phone
             keyboard = [[InlineKeyboardButton("Back to Task Setup", callback_data=f"back_to_task_setup_{phone}")]]
             markup = InlineKeyboardMarkup(keyboard)
-            query.edit_message_text(
-                "Enter start time (HH:MM, e.g., 17:30):",
-                reply_markup=markup
-            )
+            query.edit_message_text("Enter start time (HH:MM, e.g., 17:30):", reply_markup=markup)
             return WAITING_FOR_START_TIME
+
         elif data.startswith("set_interval_"):
             phone = data.split("_")[2]
             context.user_data['setting_phone'] = phone
@@ -902,6 +1021,7 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Select repetition interval:", reply_markup=markup)
             return TASK_SETUP
+
         elif data.startswith("interval_"):
             parts = data.split("_")
             phone, unit, value = parts[1], parts[2], int(parts[3])
@@ -934,6 +1054,7 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text(message, reply_markup=markup)
             return TASK_SETUP
+
         elif data.startswith("toggle_status_"):
             phone = data.split("_")[2]
             task_config = context.user_data[f'task_config_{phone}']
@@ -964,6 +1085,7 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text(message, reply_markup=markup)
             return TASK_SETUP
+
         elif data.startswith("save_task_"):
             phone = data.split("_")[2]
             task_config = context.user_data[f'task_config_{phone}']
@@ -986,6 +1108,7 @@ def handle_callback(update: Update, context):
             del context.user_data[f'task_config_{phone}']
             context.user_data['setting_phone'] = None
             return ConversationHandler.END
+
         elif data.startswith("back_to_task_setup_"):
             phone = data.split("_")[3]
             context.user_data['setting_phone'] = phone
@@ -1016,6 +1139,7 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text(message, reply_markup=markup)
             return TASK_SETUP
+
         elif data == "cancel_task":
             phone = context.user_data.get('setting_phone')
             if phone and f'task_config_{phone}' in context.user_data:
@@ -1023,92 +1147,10 @@ def handle_callback(update: Update, context):
             context.user_data['setting_phone'] = None
             query.edit_message_text("Task setup cancelled.")
             return ConversationHandler.END
+
         elif data == "back_to_client_menu":
             return client_menu(update, context)
-        elif data == "client_add_target_group":
-            keyboard = [[InlineKeyboardButton("Back to Client Menu", callback_data="back_to_client_menu")]]
-            markup = InlineKeyboardMarkup(keyboard)
-            query.edit_message_text("Send target group link(s) (one per line):", reply_markup=markup)
-            return WAITING_FOR_TARGET_GROUP
-        elif data == "client_manage_folders":
-            with db_lock:
-                cursor.execute("SELECT dedicated_userbots FROM clients WHERE user_id = ?", (user_id,))
-                result = cursor.fetchone()
-                userbots_str = result[0] if result else ""
-            userbot_phones = userbots_str.split(",") if userbots_str else []
-            if not userbot_phones:
-                query.edit_message_text("No userbots assigned.")
-                return ConversationHandler.END
-            message = "Select a userbot to manage its folders:\n"
-            keyboard = []
-            for phone in userbot_phones:
-                with db_lock:
-                    cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-                    result = cursor.fetchone()
-                    username = result[0] if result and result[0] else None
-                display_name = f"@{username}" if username else f"{phone} (no username set)"
-                keyboard.append([InlineKeyboardButton(display_name, callback_data=f"manage_folder_for_{phone}")])
-            markup = InlineKeyboardMarkup(keyboard)
-            query.edit_message_text(message, reply_markup=markup)
-            return ConversationHandler.END
-        elif data.startswith("manage_folder_for_"):
-            phone = data.split("_")[-1]
-            context.user_data['selected_userbot'] = phone
-            with db_lock:
-                cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-                result = cursor.fetchone()
-                username = result[0] if result and result[0] else None
-            display_name = f"@{username}" if username else f"{phone} (no username set)"
-            keyboard = [
-                [InlineKeyboardButton("Use Existing Folder", callback_data=f"use_folder_{phone}")],
-                [InlineKeyboardButton("Create New Folder", callback_data=f"create_folder_{phone}")],
-                [InlineKeyboardButton(get_text(user_id, 'back_to_menu'), callback_data="back_to_client_menu")]
-            ]
-            markup = InlineKeyboardMarkup(keyboard)
-            query.edit_message_text(f"Manage folders for {display_name}:", reply_markup=markup)
-            return ConversationHandler.END
-        elif data.startswith("use_folder_"):
-            phone = data.split("_")[2]
-            with db_lock:
-                cursor.execute("SELECT id, name FROM folders WHERE created_by = ?", (str(user_id),))
-                folders = cursor.fetchall()
-            if not folders:
-                query.edit_message_text("No folders available. Create a new one first.")
-                return ConversationHandler.END
-            keyboard = [[InlineKeyboardButton(f[1], callback_data=f"select_folder_{phone}_{f[0]}")] for f in folders]
-            markup = InlineKeyboardMarkup(keyboard)
-            with db_lock:
-                cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-                result = cursor.fetchone()
-                username = result[0] if result and result[0] else None
-            display_name = f"@{username}" if username else f"{phone} (no username set)"
-            query.edit_message_text(f"Select a folder for {display_name}:", reply_markup=markup)
-            return ConversationHandler.END
-        elif data.startswith("create_folder_"):
-            phone = data.split("_")[2]
-            context.user_data['setting_phone'] = phone
-            with db_lock:
-                cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-                result = cursor.fetchone()
-                username = result[0] if result and result[0] else None
-            display_name = f"@{username}" if username else f"{phone} (no username set)"
-            keyboard = [[InlineKeyboardButton("Back to Client Menu", callback_data="back_to_client_menu")]]
-            markup = InlineKeyboardMarkup(keyboard)
-            query.edit_message_text(f"Enter the name for the new folder for {display_name}:", reply_markup=markup)
-            return WAITING_FOR_FOLDER_NAME
-        elif data.startswith("select_folder_"):
-            parts = data.split("_")
-            phone, folder_id = parts[2], int(parts[3])
-            with db_lock:
-                cursor.execute("UPDATE userbot_settings SET folder_id = ? WHERE userbot_phone = ?", (folder_id, phone))
-                db.commit()
-            with db_lock:
-                cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-                result = cursor.fetchone()
-                username = result[0] if result and result[0] else None
-            display_name = f"@{username}" if username else f"{phone} (no username set)"
-            query.edit_message_text(f"Folder set for {display_name}.")
-            return ConversationHandler.END
+
         elif data == "client_set_language":
             keyboard = [
                 [InlineKeyboardButton("English", callback_data="lang_en")],
@@ -1116,11 +1158,12 @@ def handle_callback(update: Update, context):
                 [InlineKeyboardButton("Polski", callback_data="lang_pl")],
                 [InlineKeyboardButton("Lietuvių", callback_data="lang_lt")],
                 [InlineKeyboardButton("Русский", callback_data="lang_ru")],
-                [InlineKeyboardButton("Back to Client Menu", callback_data="back_to_client_menu")]
+                [InlineKeyboardButton(get_text(user_id, 'back_to_menu'), callback_data="back_to_client_menu")]
             ]
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text(get_text(user_id, 'select_language'), reply_markup=markup)
             return ConversationHandler.END
+
         elif data.startswith("lang_"):
             lang = data.split("_")[1]
             with db_lock:
@@ -1130,6 +1173,7 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text(get_text(user_id, 'language_set', lang=lang), reply_markup=markup)
             return ConversationHandler.END
+
     except Exception as e:
         log_event("Callback Error", f"User: {user_id}, Data: {data}, Error: {e}")
         query.edit_message_text(f"Error: {str(e)}. Please check your input and try again.")
@@ -1194,7 +1238,6 @@ def get_api_id(update: Update, context):
         return WAITING_FOR_API_ID
 
 def get_api_hash(update: Update, context):
-    """Process the API hash input for userbot setup."""
     try:
         api_hash = update.message.text.strip()
         if not api_hash or len(api_hash) < 8:
@@ -1357,11 +1400,10 @@ def process_folder_name(update: Update, context):
                 return WAITING_FOR_FOLDER_NAME
             cursor.execute("INSERT INTO folders (name, created_by) VALUES (?, ?)", (folder_name, str(user_id)))
             folder_id = cursor.lastrowid
-            cursor.execute("UPDATE clients SET folder_name = ? WHERE user_id = ?", (folder_name, user_id))
             db.commit()
         context.user_data['folder_name'] = folder_name
         context.user_data['folder_id'] = folder_id
-        update.message.reply_text(f"Folder '{folder_name}' created and set as your active folder. Now, send target group link(s) (one per line):")
+        update.message.reply_text(f"Folder '{folder_name}' created. Now, send target group link(s) (one per line):")
         return WAITING_FOR_GROUP_URLS
     except Exception as e:
         log_event("Folder Name Error", f"User: {user_id}, Error: {e}")
@@ -1376,11 +1418,20 @@ def process_add_group(update: Update, context):
             update.message.reply_text("Finished adding groups.")
             return client_menu(update, context)
         urls = [url.strip() for url in text.split('\n') if url.strip()]
-        folder_id = context.user_data.get('selected_folder_id') or context.user_data.get('folder_id')
-        phone = context.user_data.get('selected_phone') or context.user_data.get('setting_phone')
-        if not folder_id or not phone:
-            update.message.reply_text("No folder or phone selected. Please start over.")
+        folder_id = context.user_data.get('folder_id')
+        if not folder_id:
+            update.message.reply_text("No folder selected. Please start over.")
             return ConversationHandler.END
+        
+        # Assuming the first userbot is used for admin group addition
+        with db_lock:
+            cursor.execute("SELECT dedicated_userbots FROM clients WHERE user_id = ?", (user_id,))
+            result = cursor.fetchone()
+            userbots_str = result[0] if result else ""
+        if not userbots_str:
+            update.message.reply_text("No userbots assigned.")
+            return ConversationHandler.END
+        phone = userbots_str.split(",")[0]
         client, loop, lock = get_userbot_client(phone)
         if not client:
             update.message.reply_text("Failed to initialize userbot client.")
@@ -1391,18 +1442,12 @@ def process_add_group(update: Update, context):
             result = cursor.fetchone()
             username = result[0] if result and result[0] else None
         display_name = f"@{username}" if username else f"{phone} (no username set)"
-        if len(urls) > 10:
-            update.message.reply_text(
-                f"This may take a bit of time due to the number of groups. "
-                f"You can close the bot and come back later. "
-                f"To speed up the process, you can add {display_name} to the target groups yourself."
-            )
-
+        
         async def run_join_tasks():
             async with lock:
                 await client.start()
                 try:
-                    results = await join_groups(client, urls, folder_id, phone)
+                    results = await join_groups(client, urls, folder_id, phone, str(user_id))
                 finally:
                     await client.disconnect()
             return results
@@ -1414,10 +1459,7 @@ def process_add_group(update: Update, context):
         failed_urls = []
         for url, result in zip(urls, results):
             if isinstance(result, Exception):
-                if isinstance(result, asyncio.TimeoutError):
-                    feedback.append(f"{url}: Timeout - Join operation took too long")
-                else:
-                    feedback.append(f"{url}: Failed - {str(result)}")
+                feedback.append(f"{url}: Failed - {str(result)}")
                 failed_urls.append(url)
             else:
                 success, msg = result
@@ -1436,12 +1478,146 @@ def process_add_group(update: Update, context):
         if failed_urls:
             update.message.reply_text(
                 f"Failed to join the following groups:\n- " + "\n- ".join(failed_urls) +
-                f"\nPlease try again in 15-30 minutes or add {display_name} to these groups manually."
+                f"\nPlease try again later or add {display_name} to these groups manually."
             )
         return WAITING_FOR_GROUP_URLS
     except Exception as e:
         log_event("Add Group Error", f"User: {user_id}, Error: {e}")
         update.message.reply_text(f"Error adding groups: {e}")
+        return ConversationHandler.END
+
+def process_group_links(update: Update, context):
+    """Process group links for joining or folder management."""
+    try:
+        user_id = update.effective_user.id
+        links = [url.strip() for url in update.message.text.split('\n') if url.strip()]
+        selected_userbot = context.user_data.get('selected_userbot')
+        folder_id = context.user_data.get('selected_folder_id')
+        folder_action = context.user_data.get('folder_action')
+
+        if selected_userbot:  # Handling "Join Target Groups"
+            with db_lock:
+                cursor.execute("SELECT dedicated_userbots FROM clients WHERE user_id = ?", (user_id,))
+                result = cursor.fetchone()
+                userbots_str = result[0] if result else ""
+            if not userbots_str:
+                update.message.reply_text("No userbots assigned.")
+                return ConversationHandler.END
+            phones = userbots_str.split(",") if selected_userbot == "all" else [selected_userbot]
+            
+            # Prompt user to select or create a folder if not already set
+            if not folder_id:
+                with db_lock:
+                    cursor.execute("SELECT id, name FROM folders WHERE created_by = ?", (str(user_id),))
+                    folders = cursor.fetchall()
+                if folders:
+                    keyboard = [[InlineKeyboardButton(f[1], callback_data=f"join_folder_{f[0]}")] for f in folders]
+                    keyboard.append([InlineKeyboardButton("Create New Folder", callback_data="join_create_folder")])
+                else:
+                    keyboard = [[InlineKeyboardButton("Create New Folder", callback_data="join_create_folder")]]
+                keyboard.append([InlineKeyboardButton(get_text(user_id, 'back_to_menu'), callback_data="back_to_client_menu")])
+                markup = InlineKeyboardMarkup(keyboard)
+                context.user_data['pending_links'] = links
+                update.message.reply_text("Select a folder to add these groups to or create a new one:", reply_markup=markup)
+                return WAITING_FOR_FOLDER_SELECTION
+            else:
+                # Proceed with joining groups
+                for phone in phones:
+                    client, loop, lock = get_userbot_client(phone)
+                    if not client:
+                        update.message.reply_text(f"Failed to initialize userbot {phone}.")
+                        continue
+                    async def join_groups_task():
+                        async with lock:
+                            await client.start()
+                            try:
+                                results = await join_groups(client, links, folder_id, phone, str(user_id))
+                            finally:
+                                await client.disconnect()
+                        return results
+                    results = asyncio.run_coroutine_threadsafe(join_groups_task(), loop).result()
+                    success_count = 0
+                    feedback = []
+                    for url, result in zip(links, results):
+                        if isinstance(result, Exception):
+                            feedback.append(f"{url}: Failed - {str(result)}")
+                        else:
+                            success, msg = result
+                            if success:
+                                success_count += 1
+                            feedback.append(f"{url}: {msg}")
+                    with db_lock:
+                        cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
+                        result = cursor.fetchone()
+                        username = result[0] if result and result[0] else None
+                    display_name = f"@{username}" if username else f"{phone} (no username set)"
+                    update.message.reply_text(f"Userbot {display_name} added {success_count} out of {len(links)} groups.")
+                    if feedback:
+                        update.message.reply_text("Details:\n" + "\n".join(feedback))
+                context.user_data.clear()
+                return client_menu(update, context)
+
+        elif folder_action:  # Handling "Manage Folders"
+            if not folder_id:
+                update.message.reply_text("No folder selected. Please start over.")
+                return ConversationHandler.END
+            with db_lock:
+                cursor.execute("SELECT dedicated_userbots FROM clients WHERE user_id = ?", (user_id,))
+                result = cursor.fetchone()
+                userbots_str = result[0] if result else ""
+            if not userbots_str:
+                update.message.reply_text("No userbots assigned.")
+                return ConversationHandler.END
+            phone = userbots_str.split(",")[0]  # Use the first userbot
+            client, loop, lock = get_userbot_client(phone)
+            if not client:
+                update.message.reply_text(f"Failed to initialize userbot {phone}.")
+                return ConversationHandler.END
+
+            if folder_action == "update_folder_list":
+                with db_lock:
+                    cursor.execute("DELETE FROM target_groups WHERE folder_id = ? AND added_by = ?", (folder_id, str(user_id)))
+                    db.commit()
+                action_desc = "updated"
+            else:  # add_to_folder_list
+                action_desc = "added to"
+
+            async def manage_folder_task():
+                async with lock:
+                    await client.start()
+                    try:
+                        results = await join_groups(client, links, folder_id, phone, str(user_id))
+                    finally:
+                        await client.disconnect()
+                    return results
+
+            results = asyncio.run_coroutine_threadsafe(manage_folder_task(), loop).result()
+            success_count = 0
+            feedback = []
+            for url, result in zip(links, results):
+                if isinstance(result, Exception):
+                    feedback.append(f"{url}: Failed - {str(result)}")
+                else:
+                    success, msg = result
+                    if success:
+                        success_count += 1
+                    feedback.append(f"{url}: {msg}")
+            with db_lock:
+                cursor.execute("SELECT name FROM folders WHERE id = ?", (folder_id,))
+                folder_name = cursor.fetchone()[0]
+            update.message.reply_text(f"{success_count} out of {len(links)} group(s) {action_desc} folder '{folder_name}'.")
+            if feedback:
+                update.message.reply_text("Details:\n" + "\n".join(feedback))
+            context.user_data.clear()
+            return client_menu(update, context)
+
+        else:
+            update.message.reply_text("Invalid operation. Please start over.")
+            return ConversationHandler.END
+
+    except Exception as e:
+        log_event("Process Group Links Error", f"User: {user_id}, Error: {e}")
+        update.message.reply_text(f"Error: {str(e)}. Please try again.")
         return ConversationHandler.END
 
 def process_message_link(update: Update, context):
@@ -1677,21 +1853,6 @@ def process_add_userbots_count(update: Update, context):
     context.user_data.clear()
     return admin_panel(update, context)
 
-def show_errors(update: Update, context):
-    try:
-        if not is_admin(update.effective_user.id):
-            update.message.reply_text("Unauthorized")
-            return
-        with open('bot.log', 'r') as log_file:
-            lines = log_file.readlines()[-10:]
-        if not lines:
-            update.message.reply_text("No errors yet logged.")
-            return
-        update.message.reply_text("Recent errors:\n" + "\n".join(lines))
-    except Exception as e:
-        log_event("Show Errors Error", f"Error: {e}")
-        update.message.reply_text(f"Error reading logs: {e}")
-
 def cancel(update: Update, context):
     try:
         if 'client' in context.user_data:
@@ -1744,9 +1905,8 @@ async def forward_task(bot, user_id, phone):
                     return
                 current_time = int(datetime.now(utc_tz).timestamp())
                 interval = repetition_interval * 60  # Convert minutes to seconds
-                # Ensure task runs only within a 60-second window of start_time to prevent overlap
                 if not (start_time <= current_time < start_time + 60):
-                    return  # Skip if not within the exact time window
+                    return
 
                 logging.info(f"Task triggered for user {user_id}, userbot {phone}: current_time={current_time}, start_time={start_time}, interval={interval}")
 
@@ -1815,7 +1975,6 @@ async def forward_task(bot, user_id, phone):
                         successful_groups += 1
                     except Exception as e:
                         log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Group: {group_id}, Error: {e}")
-                    # Add a small random delay (1-2 seconds) between groups
                     await asyncio.sleep(random.uniform(1, 2))
 
                 with db_lock:
@@ -1919,6 +2078,9 @@ conv_handler = ConversationHandler(
         WAITING_FOR_ADD_USERBOTS_CODE: [MessageHandler(Filters.text & ~Filters.command, process_add_userbots_code)],
         WAITING_FOR_ADD_USERBOTS_COUNT: [MessageHandler(Filters.text & ~Filters.command, process_add_userbots_count)],
         SELECT_TARGET_GROUPS: [CallbackQueryHandler(handle_callback)],
+        WAITING_FOR_USERBOT_SELECTION: [CallbackQueryHandler(handle_callback)],
+        WAITING_FOR_GROUP_LINKS: [MessageHandler(Filters.text & ~Filters.command, process_group_links)],
+        WAITING_FOR_FOLDER_ACTION: [CallbackQueryHandler(handle_callback)],
     },
     fallbacks=[CommandHandler('cancel', cancel)],
     allow_reentry=True,
