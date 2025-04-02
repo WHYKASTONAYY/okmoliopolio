@@ -9,7 +9,6 @@ import sys
 import types
 import filetype
 import asyncio
-import traceback
 import time
 import signal
 import random
@@ -101,7 +100,7 @@ userbots_lock = threading.Lock()
     WAITING_FOR_EXTEND_CODE, WAITING_FOR_EXTEND_DAYS,
     WAITING_FOR_ADD_USERBOTS_CODE, WAITING_FOR_ADD_USERBOTS_COUNT, SELECT_TARGET_GROUPS,
     WAITING_FOR_USERBOT_SELECTION, WAITING_FOR_GROUP_LINKS, WAITING_FOR_FOLDER_ACTION
-) = range(24)  # Removed unused states
+) = range(24)
 
 # Translations dictionary
 translations = {
@@ -174,6 +173,7 @@ try:
             CREATE TABLE target_groups (
                 group_id INTEGER,
                 group_name TEXT,
+                group_link TEXT,
                 added_by TEXT,
                 folder_id INTEGER,
                 PRIMARY KEY (group_id, added_by)
@@ -265,7 +265,12 @@ def format_lithuanian_time(timestamp):
     return datetime.fromtimestamp(timestamp, utc_tz).astimezone(lithuania_tz).strftime('%H:%M') if timestamp else "Not set"
 
 def format_interval(minutes):
-    return f"Every {minutes // 60} hour{'s' if minutes // 60 > 1 else ''}" if minutes and minutes % 60 == 0 else f"Every {minutes} minute{'s' if minutes and minutes > 1 else ''}" if minutes else "Not set"
+    if minutes is None:
+        return "Not set"
+    if minutes % 60 == 0:
+        hours = minutes // 60
+        return f"Every {hours} hour{'s' if hours > 1 else ''}"
+    return f"Every {minutes} minute{'s' if minutes > 1 else ''}"
 
 def parse_telegram_url(url):
     if url.startswith("https://t.me/"):
@@ -296,7 +301,7 @@ async def get_message_from_link(client, link):
 
 async def get_chat_from_link(client, link):
     if link.startswith("https://t.me/+"):
-        updates = await client(ImportChatInviteRequest(link[len("https://t.me/+"):] ))
+        updates = await client(ImportChatInviteRequest(link[len("https://t.me/+"):]))
         return updates.chats[0].id
     elif link.startswith("https://t.me/c/"):
         match = re.search(r'https://t.me/c/(\d+)/\d+', link)
@@ -372,8 +377,8 @@ async def add_and_join_group(client, group_url, folder_id, added_by, phone):
                 with db_lock:
                     cursor.execute("SELECT group_id FROM target_groups WHERE group_id = ? AND added_by = ?", (group_id, added_by))
                     if not cursor.fetchone():
-                        cursor.execute("INSERT INTO target_groups (group_id, group_name, added_by, folder_id) VALUES (?, ?, ?, ?)",
-                                       (group_id, group_name, added_by, folder_id))
+                        cursor.execute("INSERT INTO target_groups (group_id, group_name, group_link, added_by, folder_id) VALUES (?, ?, ?, ?, ?)",
+                                       (group_id, group_name, group_url, added_by, folder_id))
                         db.commit()
                 return True, f"Already a member of {group_name} (ID: {group_id})"
             else:
@@ -382,8 +387,8 @@ async def add_and_join_group(client, group_url, folder_id, added_by, phone):
                 if is_member_after_join:
                     logging.info(f"Successfully joined group: {group_name}")
                     with db_lock:
-                        cursor.execute("INSERT INTO target_groups (group_id, group_name, added_by, folder_id) VALUES (?, ?, ?, ?)",
-                                       (group_id, group_name, added_by, folder_id))
+                        cursor.execute("INSERT INTO target_groups (group_id, group_name, group_link, added_by, folder_id) VALUES (?, ?, ?, ?, ?)",
+                                       (group_id, group_name, group_url, added_by, folder_id))
                         db.commit()
                     return True, f"Successfully joined {group_name} (ID: {group_id})"
                 else:
@@ -413,6 +418,26 @@ async def join_groups(client, urls, folder_id, phone, added_by):
     results = await asyncio.gather(*tasks, return_exceptions=True)
     return results
 
+async def add_groups_to_folder(client, urls, folder_id, added_by):
+    results = []
+    for url in urls:
+        try:
+            group_type, identifier = parse_telegram_url(url)
+            if group_type == "addlist":
+                results.append((url, False, "Addlist links not supported"))
+                continue
+            entity = await client.get_entity(identifier)
+            chat = entity
+            group_id, group_name = chat.id, chat.title
+            with db_lock:
+                cursor.execute("INSERT OR IGNORE INTO target_groups (group_id, group_name, group_link, added_by, folder_id) VALUES (?, ?, ?, ?, ?)",
+                               (group_id, group_name, url, added_by, folder_id))
+                db.commit()
+            results.append((url, True, f"Added {group_name} to folder"))
+        except Exception as e:
+            results.append((url, False, str(e)))
+    return results
+
 async def join_target_groups(client, lock, folder_id, phone):
     async with lock:
         try:
@@ -438,7 +463,7 @@ async def join_target_groups(client, lock, folder_id, phone):
                 return 0, 0, ["No target groups found."]
         except Exception as e:
             log_event("Join Error", f"Phone: {phone}, Error: {e}")
-            print(f"Error in join_target_groups for {phone}: {e}\n{traceback.format_exc()}")
+            print(f"Error in join_target_groups for {phone}: {e}")
             return 0, 0, [f"Error joining target groups: {e}"]
 
 # Handlers
@@ -492,7 +517,7 @@ async def join_existing_target_groups(client, lock, user_id, phone):
                 return 0, 0
         except Exception as e:
             log_event("Join Error", f"User: {user_id}, Phone: {phone}, Error: {e}")
-            print(f"Error in join_existing_target_groups for user {user_id}: {e}\n{traceback.format_exc()}")
+            print(f"Error in join_existing_target_groups for user {user_id}: {e}")
             return 0, 0
 
 def admin_panel(update: Update, context):
@@ -556,6 +581,7 @@ def client_menu(update: Update, context):
             [InlineKeyboardButton(get_text(user_id, 'setup_tasks'), callback_data="client_setup_tasks")],
             [InlineKeyboardButton(get_text(user_id, 'manage_folders'), callback_data="client_manage_folders")],
             [InlineKeyboardButton(get_text(user_id, 'join_target_groups'), callback_data="client_join_target_groups")],
+            [InlineKeyboardButton("Already Joined Groups", callback_data="client_joined_groups")],
             [InlineKeyboardButton(get_text(user_id, 'logs'), callback_data="client_view_logs")],
             [InlineKeyboardButton(get_text(user_id, 'set_language'), callback_data="client_set_language")]
         ]
@@ -603,6 +629,60 @@ def handle_callback(update: Update, context):
             markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Send the list of group links (one per line):", reply_markup=markup)
             return WAITING_FOR_GROUP_LINKS
+
+        elif data == "client_joined_groups":
+            with db_lock:
+                cursor.execute("SELECT dedicated_userbots FROM clients WHERE user_id = ?", (user_id,))
+                result = cursor.fetchone()
+            if result and result[0]:
+                userbot_phones = result[0].split(",")
+                keyboard = []
+                for phone in userbot_phones:
+                    with db_lock:
+                        cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
+                        result = cursor.fetchone()
+                        username = result[0] if result and result[0] else None
+                    display_name = f"@{username}" if username else f"{phone} (no username set)"
+                    keyboard.append([InlineKeyboardButton(display_name, callback_data=f"view_joined_{phone}")])
+                keyboard.append([InlineKeyboardButton(get_text(user_id, 'back_to_menu'), callback_data="back_to_client_menu")])
+                markup = InlineKeyboardMarkup(keyboard)
+                query.edit_message_text("Select a userbot to view joined groups:", reply_markup=markup)
+                return ConversationHandler.END
+            else:
+                query.edit_message_text("No userbots assigned.")
+                return ConversationHandler.END
+
+        elif data.startswith("view_joined_"):
+            phone = data.split("_")[2]
+            client, loop, lock = get_userbot_client(phone)
+            if not client:
+                query.edit_message_text(f"Failed to initialize userbot {phone}.")
+                return ConversationHandler.END
+            async def get_joined_groups():
+                async with lock:
+                    await client.start()
+                    try:
+                        dialogs = await client.get_dialogs()
+                        groups = [dialog for dialog in dialogs if dialog.is_group]
+                        group_links = []
+                        for group in groups:
+                            if group.entity.username:
+                                link = f"https://t.me/{group.entity.username}"
+                            else:
+                                link = f"Private group: {group.entity.title}"
+                            group_links.append(link)
+                        return group_links
+                    finally:
+                        await client.disconnect()
+            group_links = asyncio.run_coroutine_threadsafe(get_joined_groups(), loop).result()
+            if group_links:
+                message = "Joined groups:\n" + "\n".join(group_links)
+            else:
+                message = "No joined groups found."
+            keyboard = [[InlineKeyboardButton(get_text(user_id, 'back_to_menu'), callback_data="back_to_client_menu")]]
+            markup = InlineKeyboardMarkup(keyboard)
+            query.edit_message_text(message, reply_markup=markup)
+            return ConversationHandler.END
 
         elif data == "client_view_logs":
             with db_lock:
@@ -654,7 +734,7 @@ def handle_callback(update: Update, context):
                 cursor.execute("SELECT name FROM folders WHERE id = ?", (folder_id,))
                 result = cursor.fetchone()
                 folder_name = result[0] if result else "Not set"
-                cursor.execute("SELECT group_name FROM target_groups WHERE folder_id = ?", (folder_id,))
+                cursor.execute("SELECT group_link FROM target_groups WHERE folder_id = ?", (folder_id,))
                 existing_groups = [row[0] for row in cursor.fetchall()]
             message = f"Folder: {folder_name}\nExisting groups:\n- " + "\n- ".join(existing_groups) if existing_groups else "No groups in this folder."
             keyboard = [
@@ -710,7 +790,7 @@ def handle_callback(update: Update, context):
                 cursor.execute("SELECT name FROM folders WHERE id = ?", (folder_id,))
                 result = cursor.fetchone()
                 folder_name = result[0] if result else "Not set"
-                cursor.execute("SELECT group_name FROM target_groups WHERE folder_id = ?", (folder_id,))
+                cursor.execute("SELECT group_link FROM target_groups WHERE folder_id = ?", (folder_id,))
                 existing_groups = [row[0] for row in cursor.fetchall()]
             context.user_data['folder_id'] = folder_id
             context.user_data['folder_name'] = folder_name
@@ -1004,7 +1084,7 @@ def handle_callback(update: Update, context):
             phone = data.split("_")[2]
             context.user_data['setting_phone'] = phone
             keyboard = [[InlineKeyboardButton("Back to Task Setup", callback_data=f"back_to_task_setup_{phone}")]]
-            markup = InlineKeyboardMarkup(keyboard)
+            markup = InlineKeyboardMarkup langerous(keyboard) # type: ignore
             query.edit_message_text("Enter start time (HH:MM, e.g., 17:30):", reply_markup=markup)
             return WAITING_FOR_START_TIME
 
@@ -1368,6 +1448,7 @@ def process_generate_invite(update: Update, context):
                     return WAITING_FOR_SUB_DETAILS
         code = str(uuid.uuid4())[:8]
         sub_end = int((datetime.now(utc_tz) + timedelta(days=days)).timestamp())
+        logging.info(f"Generated sub_end: {sub_end}, which is {datetime.fromtimestamp(sub_end, utc_tz)}")
         with db_lock:
             cursor.execute("SELECT phone_number FROM userbots WHERE assigned_client IS NULL LIMIT ?", (num_userbots,))
             available = [row[0] for row in cursor.fetchall()]
@@ -1423,7 +1504,6 @@ def process_add_group(update: Update, context):
             update.message.reply_text("No folder selected. Please start over.")
             return ConversationHandler.END
         
-        # Assuming the first userbot is used for admin group addition
         with db_lock:
             cursor.execute("SELECT dedicated_userbots FROM clients WHERE user_id = ?", (user_id,))
             result = cursor.fetchone()
@@ -1443,43 +1523,33 @@ def process_add_group(update: Update, context):
             username = result[0] if result and result[0] else None
         display_name = f"@{username}" if username else f"{phone} (no username set)"
         
-        async def run_join_tasks():
+        async def run_add_groups_task():
             async with lock:
                 await client.start()
                 try:
-                    results = await join_groups(client, urls, folder_id, phone, str(user_id))
+                    results = await add_groups_to_folder(client, urls, folder_id, str(user_id))
                 finally:
                     await client.disconnect()
             return results
 
-        results = asyncio.run_coroutine_threadsafe(run_join_tasks(), loop).result(timeout=180)
+        results = asyncio.run_coroutine_threadsafe(run_add_groups_task(), loop).result(timeout=180)
         success_count = 0
         feedback = []
         addlist_detected = False
         failed_urls = []
-        for url, result in zip(urls, results):
-            if isinstance(result, Exception):
-                feedback.append(f"{url}: Failed - {str(result)}")
-                failed_urls.append(url)
+        for url, (success, msg) in zip(urls, results):
+            if success:
+                success_count += 1
             else:
-                success, msg = result
-                if success:
-                    success_count += 1
-                else:
-                    failed_urls.append(url)
-                if "Addlist links are not supported" in msg:
-                    addlist_detected = True
-                feedback.append(f"{url}: {msg}")
-        update.message.reply_text(f"Added {success_count} out of {len(urls)} group(s) to folder ID {folder_id}.")
+                failed_urls.append(url)
+            if "Addlist links not supported" in msg:
+                addlist_detected = True
+            feedback.append(f"{url}: {msg}")
+        update.message.reply_text(f"Added {success_count} out of {len(urls)} group(s) to folder.")
         if feedback:
             update.message.reply_text("Details:\n" + "\n".join(feedback))
         if addlist_detected:
             update.message.reply_text("Note: Addlist links (e.g., https://t.me/addlist/...) are not supported. Please provide individual group links instead.")
-        if failed_urls:
-            update.message.reply_text(
-                f"Failed to join the following groups:\n- " + "\n- ".join(failed_urls) +
-                f"\nPlease try again later or add {display_name} to these groups manually."
-            )
         return WAITING_FOR_GROUP_URLS
     except Exception as e:
         log_event("Add Group Error", f"User: {user_id}, Error: {e}")
@@ -1504,58 +1574,41 @@ def process_group_links(update: Update, context):
                 update.message.reply_text("No userbots assigned.")
                 return ConversationHandler.END
             phones = userbots_str.split(",") if selected_userbot == "all" else [selected_userbot]
-            
-            # Prompt user to select or create a folder if not already set
-            if not folder_id:
-                with db_lock:
-                    cursor.execute("SELECT id, name FROM folders WHERE created_by = ?", (str(user_id),))
-                    folders = cursor.fetchall()
-                if folders:
-                    keyboard = [[InlineKeyboardButton(f[1], callback_data=f"join_folder_{f[0]}")] for f in folders]
-                    keyboard.append([InlineKeyboardButton("Create New Folder", callback_data="join_create_folder")])
-                else:
-                    keyboard = [[InlineKeyboardButton("Create New Folder", callback_data="join_create_folder")]]
-                keyboard.append([InlineKeyboardButton(get_text(user_id, 'back_to_menu'), callback_data="back_to_client_menu")])
-                markup = InlineKeyboardMarkup(keyboard)
-                context.user_data['pending_links'] = links
-                update.message.reply_text("Select a folder to add these groups to or create a new one:", reply_markup=markup)
-                return WAITING_FOR_FOLDER_SELECTION
-            else:
-                # Proceed with joining groups
-                for phone in phones:
-                    client, loop, lock = get_userbot_client(phone)
-                    if not client:
-                        update.message.reply_text(f"Failed to initialize userbot {phone}.")
-                        continue
-                    async def join_groups_task():
-                        async with lock:
-                            await client.start()
-                            try:
-                                results = await join_groups(client, links, folder_id, phone, str(user_id))
-                            finally:
-                                await client.disconnect()
+            folder_id = None  # Explicitly set to None for "Join Target Groups"
+            for phone in phones:
+                client, loop, lock = get_userbot_client(phone)
+                if not client:
+                    update.message.reply_text(f"Failed to initialize userbot {phone}.")
+                    continue
+                async def join_groups_task():
+                    async with lock:
+                        await client.start()
+                        try:
+                            results = await join_groups(client, links, folder_id, phone, str(user_id))
+                        finally:
+                            await client.disconnect()
                         return results
-                    results = asyncio.run_coroutine_threadsafe(join_groups_task(), loop).result()
-                    success_count = 0
-                    feedback = []
-                    for url, result in zip(links, results):
-                        if isinstance(result, Exception):
-                            feedback.append(f"{url}: Failed - {str(result)}")
-                        else:
-                            success, msg = result
-                            if success:
-                                success_count += 1
-                            feedback.append(f"{url}: {msg}")
-                    with db_lock:
-                        cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-                        result = cursor.fetchone()
-                        username = result[0] if result and result[0] else None
-                    display_name = f"@{username}" if username else f"{phone} (no username set)"
-                    update.message.reply_text(f"Userbot {display_name} added {success_count} out of {len(links)} groups.")
-                    if feedback:
-                        update.message.reply_text("Details:\n" + "\n".join(feedback))
-                context.user_data.clear()
-                return client_menu(update, context)
+                results = asyncio.run_coroutine_threadsafe(join_groups_task(), loop).result()
+                success_count = 0
+                feedback = []
+                for url, result in zip(links, results):
+                    if isinstance(result, Exception):
+                        feedback.append(f"{url}: Failed - {str(result)}")
+                    else:
+                        success, msg = result
+                        if success:
+                            success_count += 1
+                        feedback.append(f"{url}: {msg}")
+                with db_lock:
+                    cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
+                    result = cursor.fetchone()
+                    username = result[0] if result and result[0] else None
+                display_name = f"@{username}" if username else f"{phone} (no username set)"
+                update.message.reply_text(f"Userbot {display_name} added {success_count} out of {len(links)} groups.")
+                if feedback:
+                    update.message.reply_text("Details:\n" + "\n".join(feedback))
+            context.user_data.clear()
+            return client_menu(update, context)
 
         elif folder_action:  # Handling "Manage Folders"
             if not folder_id:
@@ -1586,7 +1639,7 @@ def process_group_links(update: Update, context):
                 async with lock:
                     await client.start()
                     try:
-                        results = await join_groups(client, links, folder_id, phone, str(user_id))
+                        results = await add_groups_to_folder(client, links, folder_id, str(user_id))
                     finally:
                         await client.disconnect()
                     return results
@@ -1594,14 +1647,10 @@ def process_group_links(update: Update, context):
             results = asyncio.run_coroutine_threadsafe(manage_folder_task(), loop).result()
             success_count = 0
             feedback = []
-            for url, result in zip(links, results):
-                if isinstance(result, Exception):
-                    feedback.append(f"{url}: Failed - {str(result)}")
-                else:
-                    success, msg = result
-                    if success:
-                        success_count += 1
-                    feedback.append(f"{url}: {msg}")
+            for url, (success, msg) in zip(links, results):
+                if success:
+                    success_count += 1
+                feedback.append(f"{url}: {msg}")
             with db_lock:
                 cursor.execute("SELECT name FROM folders WHERE id = ?", (folder_id,))
                 folder_name = cursor.fetchone()[0]
@@ -1885,22 +1934,21 @@ async def forward_task(bot, user_id, phone):
                                    (user_id, phone))
                     settings = cursor.fetchone()
                 if not settings:
-                    log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Error: No settings found")
                     with db_lock:
                         cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
                         result = cursor.fetchone()
                         username = result[0] if result and result[0] else None
                     display_name = f"@{username}" if username else f"{phone} (no username set)"
-                    await asyncio.to_thread(bot.send_message, user_id, f"No settings found for userbot {display_name}.")
+                    logging.info(f"No settings found for userbot {display_name} for user {user_id}")
                     return
                 message_link, start_time, repetition_interval, status, folder_id, send_to_all_groups = settings
                 if not all([message_link, start_time, repetition_interval]) or status != 'active':
-                    log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Error: Incomplete or inactive settings")
                     with db_lock:
                         cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
                         result = cursor.fetchone()
                         username = result[0] if result and result[0] else None
                     display_name = f"@{username}" if username else f"{phone} (no username set)"
+                    log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Error: Incomplete or inactive settings")
                     await asyncio.to_thread(bot.send_message, user_id, f"Task for userbot {display_name} is incomplete or inactive.")
                     return
                 current_time = int(datetime.now(utc_tz).timestamp())
@@ -2016,10 +2064,11 @@ def check_tasks(bot):
     while True:
         try:
             with db_lock:
-                cursor.execute("SELECT user_id, dedicated_userbots FROM clients WHERE subscription_end > ?",
+                cursor.execute("SELECT user_id, dedicated_userbots, subscription_end FROM clients WHERE subscription_end > ?",
                                (int(datetime.now(utc_tz).timestamp()),))
                 clients = cursor.fetchall()
-            for user_id, userbot_phones in clients:
+            for user_id, userbot_phones, sub_end in clients:
+                logging.info(f"User {user_id} subscription ends at {sub_end} ({datetime.fromtimestamp(sub_end, utc_tz)})")
                 if userbot_phones:
                     for phone in userbot_phones.split(","):
                         client, client_loop, lock = get_userbot_client(phone)
