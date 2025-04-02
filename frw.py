@@ -1062,7 +1062,7 @@ def handle_callback(update: Update, context):
                        f"Status: {task_config['status']}")
             keyboard = [
                 [InlineKeyboardButton("Set Message", callback_data=f"set_message_{phone}")],
-                [InlineKeyboardButton("Set Time", callback_data=f"set_time_{phone}")],
+                [InlineKeyboardButton("/headerSet Time", callback_data=f"set_time_{phone}")],
                 [InlineKeyboardButton("Set Interval", callback_data=f"set_interval_{phone}")],
                 [InlineKeyboardButton(get_text(user_id, 'select_target_groups'), callback_data=f"select_target_groups_{phone}")],
                 [InlineKeyboardButton(f"{'Deactivate' if task_config['status'] == 'active' else 'Activate'}", callback_data=f"toggle_status_{phone}")],
@@ -1084,7 +1084,7 @@ def handle_callback(update: Update, context):
             phone = data.split("_")[2]
             context.user_data['setting_phone'] = phone
             keyboard = [[InlineKeyboardButton("Back to Task Setup", callback_data=f"back_to_task_setup_{phone}")]]
-            markup = InlineKeyboardMarkup langerous(keyboard) # type: ignore
+            markup = InlineKeyboardMarkup(keyboard)
             query.edit_message_text("Enter start time (HH:MM, e.g., 17:30):", reply_markup=markup)
             return WAITING_FOR_START_TIME
 
@@ -1948,8 +1948,7 @@ async def forward_task(bot, user_id, phone):
                         result = cursor.fetchone()
                         username = result[0] if result and result[0] else None
                     display_name = f"@{username}" if username else f"{phone} (no username set)"
-                    log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Error: Incomplete or inactive settings")
-                    await asyncio.to_thread(bot.send_message, user_id, f"Task for userbot {display_name} is incomplete or inactive.")
+                    logging.info(f"Task for userbot {display_name} is incomplete or inactive for user {user_id}")
                     return
                 current_time = int(datetime.now(utc_tz).timestamp())
                 interval = repetition_interval * 60  # Convert minutes to seconds
@@ -2142,5 +2141,4 @@ dp.add_handler(conv_handler)
 threading.Thread(target=check_tasks, args=(updater.bot,), daemon=True).start()
 
 # Start the bot
-updater.start_polling()
-updater.idle()
+up
