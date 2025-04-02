@@ -516,7 +516,7 @@ async def join_existing_target_groups(client, lock, user_id, phone):
             else:
                 return 0, 0
         except Exception as e:
-            log_event("Join Error", f"User: {user_id}, Phone: {phone}, Error: {e}")
+            log_event("Join Error", f"User дал: {user_id}, Phone: {phone}, Error: {e}")
             print(f"Error in join_existing_target_groups for user {user_id}: {e}")
             return 0, 0
 
@@ -1062,7 +1062,7 @@ def handle_callback(update: Update, context):
                        f"Status: {task_config['status']}")
             keyboard = [
                 [InlineKeyboardButton("Set Message", callback_data=f"set_message_{phone}")],
-                [InlineKeyboardButton("/headerSet Time", callback_data=f"set_time_{phone}")],
+                [InlineKeyboardButton("Set Time", callback_data=f"set_time_{phone}")],
                 [InlineKeyboardButton("Set Interval", callback_data=f"set_interval_{phone}")],
                 [InlineKeyboardButton(get_text(user_id, 'select_target_groups'), callback_data=f"select_target_groups_{phone}")],
                 [InlineKeyboardButton(f"{'Deactivate' if task_config['status'] == 'active' else 'Activate'}", callback_data=f"toggle_status_{phone}")],
@@ -2141,4 +2141,5 @@ dp.add_handler(conv_handler)
 threading.Thread(target=check_tasks, args=(updater.bot,), daemon=True).start()
 
 # Start the bot
-up
+updater.start_polling()
+updater.idle()
