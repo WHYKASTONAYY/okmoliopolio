@@ -1505,176 +1505,77 @@ def process_folder_name(update: Update, context):
         update.message.reply_text(f"Folder '{folder_name}' created. Now, send target group link(s) (one per line):")
         return WAITING_FOR_GROUP_URLS
     except Exception as e:
-        log_event("Folder Name Error", f"User: {user_id}, Error: {e}")
-        update.message.reply_text(f"Error creating folder: {e}")
-        return ConversationHandler.END
+        log_event("Folder Creation Error", f"User: {user_id}, Error: {e}")
+        update.message.reply_text(f"Error: {str(e)}. Please try again.")
+        return WAITING_FOR_FOLDER_NAME
 
-def process_add_group(update: Update, context):
+def process_group_urls(update: Update, context):
     try:
-        text = update.message.text.strip()
         user_id = update.effective_user.id
-        if text.lower() == 'done':
-            update.message.reply_text("Finished adding groups.")
-            return client_menu(update, context)
-        urls = [url.strip() for url in text.split('\n') if url.strip()]
+        urls = update.message.text.strip().split("\n")
         folder_id = context.user_data.get('folder_id')
         if not folder_id:
-            update.message.reply_text("No folder selected. Please start over.")
-            return JoyceHandler.END
-        
-        with db_lock:
-            cursor.execute("SELECT dedicated_userbots FROM clients WHERE user_id = ?", (user_id,))
-            result = cursor.fetchone()
-            userbots_str = result[0] if result else ""
-        if not userbots_str:
-            update.message.reply_text("No userbots assigned.")
-            return ConversationHandler.END
-        phone = userbots_str.split(",")[0]
-        client, loop, lock = get_userbot_client(phone)
+            update.message.reply_text("Folder ID not found. Please start over.")
+            return admin_panel(update, context)
+        client, loop, lock = get_userbot_client(context.user_data.get('phone', ''))
         if not client:
-            update.message.reply_text("Failed to initialize userbot client.")
-            return ConversationHandler.END
-
-        with db_lock:
-            cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-            result = cursor.fetchone()
-            username = result[0] if result and result[0] else None
-        display_name = f"@{username}" if username else f"{phone} (no username set)"
-        
-        async def run_add_groups_task():
-            async with lock:
-                await client.start()
-                try:
-                    results = await add_groups_to_folder(client, urls, folder_id, str(user_id))
-                finally:
-                    await client.disconnect()
-            return results
-
-        results = asyncio.run_coroutine_threadsafe(run_add_groups_task(), loop).result(timeout=180)
-        success_count = 0
-        feedback = []
-        addlist_detected = False
-        failed_urls = []
-        for url, (success, msg) in zip(urls, results):
-            if success:
-                success_count += 1
-            else:
-                failed_urls.append(url)
-            if "Addlist links not supported" in msg:
-                addlist_detected = True
-            feedback.append(f"{url}: {msg}")
-        update.message.reply_text(f"Added {success_count} out of {len(urls)} group(s) to folder.")
-        if feedback:
-            update.message.reply_text("Details:\n" + "\n".join(feedback))
-        if addlist_detected:
-            update.message.reply_text("Note: Addlist links (e.g., https://t.me/addlist/...) are not supported. Please provide individual group links instead.")
-        return WAITING_FOR_GROUP_URLS
+            client = TelegramClient('anon', API_ID, API_HASH)
+        results = asyncio.run_coroutine_threadsafe(join_groups(client, urls, folder_id, '', str(user_id)), loop).result()
+        message = "Join Results:\n"
+        for url, (success, detail) in zip(urls, results):
+            message += f"{url}: {detail}\n"
+        update.message.reply_text(message)
+        return admin_panel(update, context)
     except Exception as e:
-        log_event("Add Group Error", f"User: {user_id}, Error: {e}")
-        update.message.reply_text(f"Error adding groups: {e}")
-        return ConversationHandler.END
+        log_event("Process Group URLs Error", f"User: {user_id}, Error: {e}")
+        update.message.reply_text(f"Error: {str(e)}. Please try again.")
+        return admin_panel(update, context)
 
 def process_group_links(update: Update, context):
-    """Process group links for joining or folder management."""
     try:
         user_id = update.effective_user.id
-        links = [url.strip() for url in update.message.text.split('\n') if url.strip()]
+        urls = [url.strip() for url in update.message.text.strip().split("\n") if url.strip()]
         selected_userbot = context.user_data.get('selected_userbot')
         folder_id = context.user_data.get('selected_folder_id')
-        folder_action = context.user_data.get('folder_action')
 
-        if selected_userbot:  # Handling "Join Target Groups"
+        if not urls:
+            update.message.reply_text("No valid group links provided.")
+            return ConversationHandler.END
+
+        if selected_userbot == "all":
             with db_lock:
                 cursor.execute("SELECT dedicated_userbots FROM clients WHERE user_id = ?", (user_id,))
                 result = cursor.fetchone()
-                userbots_str = result[0] if result else ""
-            if not userbots_str:
+            if not result or not result[0]:
                 update.message.reply_text("No userbots assigned.")
                 return ConversationHandler.END
-            phones = userbots_str.split(",") if selected_userbot == "all" else [selected_userbot]
-            folder_id = None  # Explicitly set to None for "Join Target Groups"
-            for phone in phones:
-                client, loop, lock = get_userbot_client(phone)
-                if not client:
-                    update.message.reply_text(f"Failed to initialize userbot {phone}.")
-                    continue
-                async def join_groups_task():
-                    async with lock:
-                        await client.start()
-                        try:
-                            results = await join_groups(client, links, folder_id, phone, str(user_id))
-                        finally:
-                            await client.disconnect()
-                        return results
-                results = asyncio.run_coroutine_threadsafe(join_groups_task(), loop).result()
-                success_count = 0
-                feedback = []
-                for url, result in zip(links, results):
-                    if isinstance(result, Exception):
-                        feedback.append(f"{url}: Failed - {str(result)}")
-                    else:
-                        success, msg = result
-                        if success:
-                            success_count += 1
-                        feedback.append(f"{url}: {msg}")
-                with db_lock:
-                    cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-                    result = cursor.fetchone()
-                    username = result[0] if result and result[0] else None
-                display_name = f"@{username}" if username else f"{phone} (no username set)"
-                update.message.reply_text(f"Userbot {display_name} added {success_count} out of {len(links)} groups.")
-                if feedback:
-                    update.message.reply_text("Details:\n" + "\n".join(feedback))
-            context.user_data.clear()
-            return client_menu(update, context)
+            userbot_phones = result[0].split(",")
+        else:
+            userbot_phones = [selected_userbot]
 
-        elif folder_action:  # Handling "Manage Folders"
-            if not folder_id:
-                update.message.reply_text("No folder selected. Please start over.")
-                return ConversationHandler.END
-            with db_lock:
-                cursor.execute("SELECT dedicated_userbots FROM clients WHERE user_id = ?", (user_id,))
-                result = cursor.fetchone()
-                userbots_str = result[0] if result else ""
-            if not userbots_str:
-                update.message.reply_text("No userbots assigned.")
-                return ConversationHandler.END
-            phone = userbots_str.split(",")[0]
+        results_summary = ""
+        for phone in userbot_phones:
             client, loop, lock = get_userbot_client(phone)
             if not client:
-                update.message.reply_text("Failed to initialize userbot client.")
-                return ConversationHandler.END
+                results_summary += f"Failed to initialize userbot {phone}.\n"
+                continue
+            if folder_id:  # Folder edit mode
+                results = asyncio.run_coroutine_threadsafe(add_groups_to_folder(client, urls, folder_id, str(user_id)), loop).result()
+                for url, success, detail in results:
+                    results_summary += f"{phone}: {url} - {detail}\n"
+            else:  # Join groups mode
+                results = asyncio.run_coroutine_threadsafe(join_groups(client, urls, folder_id or 0, phone, str(user_id)), loop).result()
+                for url, (success, detail) in zip(urls, results):
+                    results_summary += f"{phone}: {url} - {detail}\n"
 
-            async def manage_folder_task():
-                async with lock:
-                    await client.start()
-                    try:
-                        if folder_action == "update_folder_list":
-                            with db_lock:
-                                cursor.execute("DELETE FROM target_groups WHERE folder_id = ? AND added_by = ?", (folder_id, str(user_id)))
-                                db.commit()
-                        results = await add_groups_to_folder(client, links, folder_id, str(user_id))
-                    finally:
-                        await client.disconnect()
-                    return results
-
-            results = asyncio.run_coroutine_threadsafe(manage_folder_task(), loop).result(timeout=180)
-            success_count = 0
-            feedback = []
-            for url, (success, msg) in zip(links, results):
-                if success:
-                    success_count += 1
-                feedback.append(f"{url}: {msg}")
-            action_text = "updated" if folder_action == "update_folder_list" else "added to"
-            update.message.reply_text(f"Folder {action_text} with {success_count} out of {len(links)} groups.")
-            if feedback:
-                update.message.reply_text("Details:\n" + "\n".join(feedback))
-            context.user_data.clear()
-            return client_menu(update, context)
-
+        update.message.reply_text(f"Operation Results:\n{results_summary}")
+        context.user_data.pop('selected_userbot', None)
+        context.user_data.pop('selected_folder_id', None)
+        context.user_data.pop('folder_action', None)
+        return client_menu(update, context)
     except Exception as e:
         log_event("Process Group Links Error", f"User: {user_id}, Error: {e}")
-        update.message.reply_text(f"Error processing group links: {e}")
+        update.message.reply_text(f"Error: {str(e)}. Please try again.")
         return ConversationHandler.END
 
 def process_primary_message_link(update: Update, context):
@@ -1683,78 +1584,71 @@ def process_primary_message_link(update: Update, context):
         link = update.message.text.strip()
         phone = context.user_data.get('setting_phone')
         if not phone:
-            update.message.reply_text("No userbot selected. Please start over.")
+            update.message.reply_text("Userbot not selected. Please start over.")
             return ConversationHandler.END
-        task_config = context.user_data[f'task_config_{phone}']
-        client, loop, lock = get_userbot_client(phone)
+        client, loop, _ = get_userbot_client(phone)
         if not client:
             update.message.reply_text(f"Failed to initialize userbot {phone}.")
             return ConversationHandler.END
-
-        async def verify_link():
-            async with lock:
-                await client.start()
-                try:
-                    await get_message_from_link(client, link)
-                    return True, None
-                except Exception as e:
-                    return False, str(e)
-                finally:
-                    await client.disconnect()
-
-        success, error = asyncio.run_coroutine_threadsafe(verify_link(), loop).result()
-        if not success:
-            update.message.reply_text(f"Invalid message link: {error}")
-            return WAITING_FOR_PRIMARY_MESSAGE_LINK
-
+        asyncio.run_coroutine_threadsafe(get_message_from_link(client, link), loop).result()
+        task_config = context.user_data[f'task_config_{phone}']
         task_config['message_link'] = link
-        keyboard = [[InlineKeyboardButton("Add Fallback Message", callback_data=f"add_fallback_{phone}"), InlineKeyboardButton("Back to Task Setup", callback_data=f"back_to_task_setup_{phone}")]]
-        markup = InlineKeyboardMarkup(keyboard)
-        update.message.reply_text("Primary message link set. Add a fallback message or return to task setup:", reply_markup=markup)
+        update.message.reply_text("Primary message link set. Now send the fallback message link (or type 'skip' to skip):")
         return WAITING_FOR_FALLBACK_MESSAGE_LINK
-
     except Exception as e:
         log_event("Primary Message Link Error", f"User: {user_id}, Error: {e}")
-        update.message.reply_text(f"Error setting message link: {e}")
-        return ConversationHandler.END
+        update.message.reply_text(f"Error: {str(e)}. Please provide a valid message link.")
+        return WAITING_FOR_PRIMARY_MESSAGE_LINK
 
 def process_fallback_message_link(update: Update, context):
     try:
         user_id = update.effective_user.id
-        link = update.message.text.strip()
+        text = update.message.text.strip()
         phone = context.user_data.get('setting_phone')
         if not phone:
-            update.message.reply_text("No userbot selected. Please start over.")
+            update.message.reply_text("Userbot not selected. Please start over.")
             return ConversationHandler.END
         task_config = context.user_data[f'task_config_{phone}']
-        client, loop, lock = get_userbot_client(phone)
-        if not client:
-            update.message.reply_text(f"Failed to initialize userbot {phone}.")
-            return ConversationHandler.END
-
-        async def verify_link():
-            async with lock:
-                await client.start()
-                try:
-                    await get_message_from_link(client, link)
-                    return True, None
-                except Exception as e:
-                    return False, str(e)
-                finally:
-                    await client.disconnect()
-
-        success, error = asyncio.run_coroutine_threadsafe(verify_link(), loop).result()
-        if not success:
-            update.message.reply_text(f"Invalid fallback message link: {error}")
-            return WAITING_FOR_FALLBACK_MESSAGE_LINK
-
-        task_config['fallback_message_link'] = link
-        return back_to_task_setup(update, context, phone)
-
+        if text.lower() == 'skip':
+            task_config['fallback_message_link'] = None
+        else:
+            client, loop, _ = get_userbot_client(phone)
+            if not client:
+                update.message.reply_text(f"Failed to initialize userbot {phone}.")
+                return ConversationHandler.END
+            asyncio.run_coroutine_threadsafe(get_message_from_link(client, text), loop).result()
+            task_config['fallback_message_link'] = text
+        with db_lock:
+            cursor.execute("SELECT name FROM folders WHERE id = ?", (task_config['folder_id'],))
+            result = cursor.fetchone()
+            folder_name = result[0] if result else "Not set"
+        with db_lock:
+            cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
+            result = cursor.fetchone()
+            username = result[0] if result and result[0] else None
+        display_name = f"@{username}" if username else f"{phone} (no username set)"
+        message = (f"Task Settings for {display_name}:\n"
+                   f"Primary Message: {task_config['message_link'] or 'Not set'}\n"
+                   f"Fallback Message: {task_config['fallback_message_link'] or 'Not set'}\n"
+                   f"Start Time: {format_lithuanian_time(task_config['start_time'])}\n"
+                   f"Interval: {format_interval(task_config['repetition_interval'])}\n"
+                   f"Target: {'All Groups' if task_config['send_to_all_groups'] else folder_name}\n"
+                   f"Status: {task_config['status']}")
+        keyboard = [
+            [InlineKeyboardButton("Set Message", callback_data=f"set_message_{phone}")],
+            [InlineKeyboardButton("Set Time", callback_data=f"set_time_{phone}")],
+            [InlineKeyboardButton("Set Interval", callback_data=f"set_interval_{phone}")],
+            [InlineKeyboardButton(get_text(user_id, 'select_target_groups'), callback_data=f"select_target_groups_{phone}")],
+            [InlineKeyboardButton(f"{'Deactivate' if task_config['status'] == 'active' else 'Activate'}", callback_data=f"toggle_status_{phone}")],
+            [InlineKeyboardButton("Save", callback_data=f"save_task_{phone}"), InlineKeyboardButton("Cancel", callback_data="cancel_task")]
+        ]
+        markup = InlineKeyboardMarkup(keyboard)
+        update.message.reply_text(message, reply_markup=markup)
+        return TASK_SETUP
     except Exception as e:
         log_event("Fallback Message Link Error", f"User: {user_id}, Error: {e}")
-        update.message.reply_text(f"Error setting fallback message link: {e}")
-        return ConversationHandler.END
+        update.message.reply_text(f"Error: {str(e)}. Please provide a valid message link or type 'skip'.")
+        return WAITING_FOR_FALLBACK_MESSAGE_LINK
 
 def process_start_time(update: Update, context):
     try:
@@ -1762,73 +1656,63 @@ def process_start_time(update: Update, context):
         time_str = update.message.text.strip()
         phone = context.user_data.get('setting_phone')
         if not phone:
-            update.message.reply_text("No userbot selected. Please start over.")
+            update.message.reply_text("Userbot not selected. Please start over.")
             return ConversationHandler.END
-        task_config = context.user_data[f'task_config_{phone}']
-        start_time = parse_lithuanian_time(time_str)
-        if not start_time:
+        timestamp = parse_lithuanian_time(time_str)
+        if not timestamp:
             update.message.reply_text("Invalid time format. Use HH:MM (e.g., 17:30).")
             return WAITING_FOR_START_TIME
-        task_config['start_time'] = start_time
-        return back_to_task_setup(update, context, phone)
+        task_config = context.user_data[f'task_config_{phone}']
+        task_config['start_time'] = timestamp
+        with db_lock:
+            cursor.execute("SELECT name FROM folders WHERE id = ?", (task_config['folder_id'],))
+            result = cursor.fetchone()
+            folder_name = result[0] if result else "Not set"
+        with db_lock:
+            cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
+            result = cursor.fetchone()
+            username = result[0] if result and result[0] else None
+        display_name = f"@{username}" if username else f"{phone} (no username set)"
+        message = (f"Task Settings for {display_name}:\n"
+                   f"Primary Message: {task_config['message_link'] or 'Not set'}\n"
+                   f"Fallback Message: {task_config['fallback_message_link'] or 'Not set'}\n"
+                   f"Start Time: {format_lithuanian_time(task_config['start_time'])}\n"
+                   f"Interval: {format_interval(task_config['repetition_interval'])}\n"
+                   f"Target: {'All Groups' if task_config['send_to_all_groups'] else folder_name}\n"
+                   f"Status: {task_config['status']}")
+        keyboard = [
+            [InlineKeyboardButton("Set Message", callback_data=f"set_message_{phone}")],
+            [InlineKeyboardButton("Set Time", callback_data=f"set_time_{phone}")],
+            [InlineKeyboardButton("Set Interval", callback_data=f"set_interval_{phone}")],
+            [InlineKeyboardButton(get_text(user_id, 'select_target_groups'), callback_data=f"select_target_groups_{phone}")],
+            [InlineKeyboardButton(f"{'Deactivate' if task_config['status'] == 'active' else 'Activate'}", callback_data=f"toggle_status_{phone}")],
+            [InlineKeyboardButton("Save", callback_data=f"save_task_{phone}"), InlineKeyboardButton("Cancel", callback_data="cancel_task")]
+        ]
+        markup = InlineKeyboardMarkup(keyboard)
+        update.message.reply_text(message, reply_markup=markup)
+        return TASK_SETUP
     except Exception as e:
         log_event("Start Time Error", f"User: {user_id}, Error: {e}")
-        update.message.reply_text(f"Error setting start time: {e}")
-        return ConversationHandler.END
-
-def back_to_task_setup(update: Update, context, phone=None):
-    if not phone:
-        phone = context.user_data.get('setting_phone')
-    if not phone:
-        update.message.reply_text("No userbot selected. Please start over.")
-        return ConversationHandler.END
-    user_id = update.effective_user.id
-    task_config = context.user_data.get(f'task_config_{phone}', {})
-    with db_lock:
-        cursor.execute("SELECT name FROM folders WHERE id = ?", (task_config.get('folder_id'),))
-        result = cursor.fetchone()
-        folder_name = result[0] if result else "Not set"
-    with db_lock:
-        cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
-        result = cursor.fetchone()
-        username = result[0] if result and result[0] else None
-    display_name = f"@{username}" if username else f"{phone} (no username set)"
-    message = (f"Task Settings for {display_name}:\n"
-               f"Primary Message: {task_config.get('message_link', 'Not set')}\n"
-               f"Fallback Message: {task_config.get('fallback_message_link', 'Not set')}\n"
-               f"Start Time: {format_lithuanian_time(task_config.get('start_time'))}\n"
-               f"Interval: {format_interval(task_config.get('repetition_interval'))}\n"
-               f"Target: {'All Groups' if task_config.get('send_to_all_groups') else folder_name}\n"
-               f"Status: {task_config.get('status', 'inactive')}")
-    keyboard = [
-        [InlineKeyboardButton("Set Message", callback_data=f"set_message_{phone}")],
-        [InlineKeyboardButton("Set Time", callback_data=f"set_time_{phone}")],
-        [InlineKeyboardButton("Set Interval", callback_data=f"set_interval_{phone}")],
-        [InlineKeyboardButton(get_text(user_id, 'select_target_groups'), callback_data=f"select_target_groups_{phone}")],
-        [InlineKeyboardButton(f"{'Deactivate' if task_config.get('status') == 'active' else 'Activate'}", callback_data=f"toggle_status_{phone}")],
-        [InlineKeyboardButton("Save", callback_data=f"save_task_{phone}"), InlineKeyboardButton("Cancel", callback_data="cancel_task")]
-    ]
-    markup = InlineKeyboardMarkup(keyboard)
-    update.message.reply_text(message, reply_markup=markup)
-    return TASK_SETUP
+        update.message.reply_text(f"Error: {str(e)}. Please try again with HH:MM format.")
+        return WAITING_FOR_START_TIME
 
 def process_extend_code(update: Update, context):
     try:
         code = update.message.text.strip()
-        user_id = update.effective_user.id
         with db_lock:
-            cursor.execute("SELECT subscription_end FROM clients WHERE invitation_code = ?", (code,))
+            cursor.execute("SELECT user_id, subscription_end FROM clients WHERE invitation_code = ?", (code,))
             result = cursor.fetchone()
         if not result:
             update.message.reply_text("Invalid code.")
             return admin_panel(update, context)
+        user_id, sub_end = result
         context.user_data['extend_code'] = code
-        update.message.reply_text("Enter the number of days to extend the subscription:")
+        update.message.reply_text(f"Current subscription ends: {datetime.fromtimestamp(sub_end).strftime('%Y-%m-%d')}\nEnter number of days to extend:")
         return WAITING_FOR_EXTEND_DAYS
     except Exception as e:
-        log_event("Extend Code Error", f"User: {user_id}, Error: {e}")
-        update.message.reply_text(f"Error: {e}")
-        return ConversationHandler.END
+        log_event("Extend Code Error", f"Error: {e}")
+        update.message.reply_text(f"Error: {str(e)}. Please try again.")
+        return WAITING_FOR_EXTEND_CODE
 
 def process_extend_days(update: Update, context):
     try:
@@ -1838,36 +1722,31 @@ def process_extend_days(update: Update, context):
             return WAITING_FOR_EXTEND_DAYS
         code = context.user_data.get('extend_code')
         if not code:
-            update.message.reply_text("No code provided. Please start over.")
+            update.message.reply_text("Code not found. Please start over.")
             return admin_panel(update, context)
         with db_lock:
             cursor.execute("SELECT subscription_end FROM clients WHERE invitation_code = ?", (code,))
-            result = cursor.fetchone()
-            if not result:
-                update.message.reply_text("Invalid code.")
-                return admin_panel(update, context)
-            current_end = result[0]
-            new_end = current_end + (days * 86400)
+            sub_end = cursor.fetchone()[0]
+            new_end = sub_end + (days * 86400)
             cursor.execute("UPDATE clients SET subscription_end = ? WHERE invitation_code = ?", (new_end, code))
             db.commit()
         log_event("Subscription Extended", f"Code: {code}, Days: {days}, New End: {datetime.fromtimestamp(new_end)}")
         update.message.reply_text(f"Subscription extended by {days} days. New end date: {datetime.fromtimestamp(new_end).strftime('%Y-%m-%d')}")
-        context.user_data.clear()
+        context.user_data.pop('extend_code', None)
         return admin_panel(update, context)
     except ValueError:
         update.message.reply_text("Please enter a valid number of days.")
         return WAITING_FOR_EXTEND_DAYS
     except Exception as e:
-        log_event("Extend Days Error", f"User: {update.effective_user.id}, Error: {e}")
-        update.message.reply_text(f"Error: {e}")
-        return ConversationHandler.END
+        log_event("Extend Days Error", f"Error: {e}")
+        update.message.reply_text(f"Error: {str(e)}. Please try again.")
+        return WAITING_FOR_EXTEND_DAYS
 
 def process_add_userbots_code(update: Update, context):
     try:
         code = update.message.text.strip()
-        user_id = update.effective_user.id
         with db_lock:
-            cursor.execute("SELECT dedicated_userbots FROM clients WHERE invitation_code = ?", (code,))
+            cursor.execute("SELECT user_id FROM clients WHERE invitation_code = ?", (code,))
             result = cursor.fetchone()
         if not result:
             update.message.reply_text("Invalid code.")
@@ -1876,9 +1755,9 @@ def process_add_userbots_code(update: Update, context):
         update.message.reply_text("Enter the number of additional userbots to assign:")
         return WAITING_FOR_ADD_USERBOTS_COUNT
     except Exception as e:
-        log_event("Add Userbots Code Error", f"User: {user_id}, Error: {e}")
-        update.message.reply_text(f"Error: {e}")
-        return ConversationHandler.END
+        log_event("Add Userbots Code Error", f"Error: {e}")
+        update.message.reply_text(f"Error: {str(e)}. Please try again.")
+        return WAITING_FOR_ADD_USERBOTS_CODE
 
 def process_add_userbots_count(update: Update, context):
     try:
@@ -1888,137 +1767,47 @@ def process_add_userbots_count(update: Update, context):
             return WAITING_FOR_ADD_USERBOTS_COUNT
         code = context.user_data.get('add_userbots_code')
         if not code:
-            update.message.reply_text("No code provided. Please start over.")
+            update.message.reply_text("Code not found. Please start over.")
             return admin_panel(update, context)
         with db_lock:
             cursor.execute("SELECT dedicated_userbots FROM clients WHERE invitation_code = ?", (code,))
-            result = cursor.fetchone()
-            if not result:
-                update.message.reply_text("Invalid code.")
-                return admin_panel(update, context)
-            current_userbots = result[0].split(",") if result[0] else []
+            current_userbots = cursor.fetchone()[0]
             cursor.execute("SELECT phone_number FROM userbots WHERE assigned_client IS NULL LIMIT ?", (count,))
             available = [row[0] for row in cursor.fetchall()]
         if len(available) < count:
-            update.message.reply_text(f"Not enough available userbots. Only {len(available)} available.")
+            update.message.reply_text(f"Only {len(available)} userbots available.")
             return admin_panel(update, context)
-        new_userbots = current_userbots + available
+        new_userbots = (current_userbots or "") + "," + ",".join(available)
         with db_lock:
-            cursor.execute("UPDATE clients SET dedicated_userbots = ? WHERE invitation_code = ?", (",".join(new_userbots), code))
+            cursor.execute("UPDATE clients SET dedicated_userbots = ? WHERE invitation_code = ?", (new_userbots.strip(","), code))
             for phone in available:
                 cursor.execute("UPDATE userbots SET assigned_client = ? WHERE phone_number = ?", (code, phone))
             db.commit()
-        log_event("Userbots Added", f"Code: {code}, Added: {count}, Total: {len(new_userbots)}")
-        update.message.reply_text(f"Added {count} userbots to client with code {code}. Total userbots: {len(new_userbots)}")
-        context.user_data.clear()
+        log_event("Userbots Added", f"Code: {code}, Count: {count}")
+        update.message.reply_text(f"Added {count} userbots to client with code {code}.")
+        context.user_data.pop('add_userbots_code', None)
         return admin_panel(update, context)
     except ValueError:
-        update.message.reply_text("Please enter a valid number of userbots.")
+        update.message.reply_text("Please enter a valid number.")
         return WAITING_FOR_ADD_USERBOTS_COUNT
     except Exception as e:
-        log_event("Add Userbots Count Error", f"User: {update.effective_user.id}, Error: {e}")
-        update.message.reply_text(f"Error: {e}")
-        return ConversationHandler.END
+        log_event("Add Userbots Count Error", f"Error: {e}")
+        update.message.reply_text(f"Error: {str(e)}. Please try again.")
+        return WAITING_FOR_ADD_USERBOTS_COUNT
 
-async def forward_message(client, chat_id, from_chat, message_id, phone, user_id):
-    try:
-        await client.forward_messages(chat_id, message_id, from_chat)
-        with db_lock:
-            cursor.execute("UPDATE clients SET total_messages_sent = total_messages_sent + 1 WHERE user_id = ?", (user_id,))
-            db.commit()
-        log_event("Message Forwarded", f"Phone: {phone}, Chat ID: {chat_id}, Message ID: {message_id}")
-        return True, None
-    except ChatSendMediaForbiddenError:
-        return False, "Cannot send media to this chat."
-    except FloodWaitError as e:
-        return False, f"Flood wait error: {e.seconds} seconds"
-    except Exception as e:
-        return False, str(e)
-
-async def execute_task(client, lock, settings, user_id, bot):
-    async with lock:
-        try:
-            await client.start()
-            current_time = int(datetime.now(utc_tz).timestamp())
-            if settings['start_time'] > current_time:
-                return
-            if settings['repetition_interval']:
-                last_run = settings.get('last_run', settings['start_time'])
-                if current_time < last_run + settings['repetition_interval'] * 60:
-                    return
-            with db_lock:
-                if settings['send_to_all_groups']:
-                    dialogs = await client.get_dialogs()
-                    target_groups = [(dialog.entity.id, dialog.entity.title) for dialog in dialogs if dialog.is_group]
-                else:
-                    cursor.execute("SELECT group_id, group_name FROM target_groups WHERE folder_id = ?", (settings['folder_id'],))
-                    target_groups = cursor.fetchall()
-            if not target_groups:
-                log_event("No Target Groups", f"Phone: {settings['userbot_phone']}, User: {user_id}")
-                return
-
-            from_chat, message_id = await get_message_from_link(client, settings['message_link'])
-            fallback_chat, fallback_id = (await get_message_from_link(client, settings['fallback_message_link']) 
-                                        if settings['fallback_message_link'] else (None, None))
-
-            success_count = 0
-            errors = []
-            for group_id, group_name in target_groups:
-                logging.info(f"Attempting to forward message to group {group_name} (ID: {group_id})")
-                success, error = await forward_message(client, PeerChannel(group_id), from_chat, message_id, settings['userbot_phone'], user_id)
-                if not success and fallback_chat and error == "Cannot send media to this chat.":
-                    logging.info(f"Using fallback message for group {group_name}")
-                    success, error = await forward_message(client, PeerChannel(group_id), fallback_chat, fallback_id, settings['userbot_phone'], user_id)
-                if success:
-                    success_count += 1
-                    logging.info(f"Successfully forwarded message to group {group_name}")
-                else:
-                    errors.append(f"{group_name}: {error}")
-                    logging.error(f"Failed to forward message to group {group_name}: {error}")
-            with db_lock:
-                cursor.execute("UPDATE clients SET groups_reached = groups_reached + ? WHERE user_id = ?", (success_count, user_id))
-                cursor.execute("UPDATE userbot_settings SET last_run = ? WHERE client_id = ? AND userbot_phone = ?", 
-                               (current_time, user_id, settings['userbot_phone']))
-                db.commit()
-            log_event("Task Executed", f"Phone: {settings['userbot_phone']}, User: {user_id}, Success: {success_count}, Errors: {len(errors)}")
-            if success_count > 0:
-                bot.send_message(user_id, f"Userbot {settings['userbot_phone']} forwarded messages to {success_count} groups.")
-            if errors:
-                bot.send_message(user_id, "Errors:\n" + "\n".join(errors[:5]))
-        except Exception as e:
-            log_event("Task Execution Error", f"Phone: {settings['userbot_phone']}, User: {user_id}, Error: {e}")
-        finally:
-            await client.disconnect()
-
-async def check_tasks(bot):
-    while True:
-        try:
-            with db_lock:
-                cursor.execute("SELECT client_id, userbot_phone, message_link, fallback_message_link, start_time, repetition_interval, status, folder_id, send_to_all_groups FROM userbot_settings WHERE status = 'active'")
-                tasks = cursor.fetchall()
-            for task in tasks:
-                settings = dict(zip(['client_id', 'userbot_phone', 'message_link', 'fallback_message_link', 'start_time', 'repetition_interval', 'status', 'folder_id', 'send_to_all_groups'], task))
-                client, loop, lock = get_userbot_client(settings['userbot_phone'])
-                if client:
-                    asyncio.run_coroutine_threadsafe(execute_task(client, lock, settings, settings['client_id'], bot), loop)
-        except Exception as e:
-            log_event("Check Tasks Error", f"Error: {e}")
-        await asyncio.sleep(CHECK_TASKS_INTERVAL)
-
-# Main bot setup
+# Async loop for background tasks
 async_loop = asyncio.new_event_loop()
 def run_async_loop():
     asyncio.set_event_loop(async_loop)
     async_loop.run_forever()
-
 threading.Thread(target=run_async_loop, daemon=True).start()
-asyncio.run_coroutine_threadsafe(check_tasks(updater.bot), async_loop)
 
+# Register handlers
 conv_handler = ConversationHandler(
     entry_points=[
         CommandHandler('start', start),
         CommandHandler('admin', admin_panel),
-        CallbackQueryHandler(handle_callback),
+        CallbackQueryHandler(handle_callback)
     ],
     states={
         WAITING_FOR_CODE: [MessageHandler(Filters.text & ~Filters.command, process_invitation_code)],
@@ -2028,32 +1817,91 @@ conv_handler = ConversationHandler(
         WAITING_FOR_CODE_USERBOT: [MessageHandler(Filters.text & ~Filters.command, get_code)],
         WAITING_FOR_PASSWORD: [MessageHandler(Filters.text & ~Filters.command, get_password)],
         WAITING_FOR_SUB_DETAILS: [MessageHandler(Filters.text & ~Filters.command, process_generate_invite)],
-        WAITING_FOR_GROUP_URLS: [MessageHandler(Filters.text & ~Filters.command, process_add_group)],
-        WAITING_FOR_FOLDER_CHOICE: [CallbackQueryHandler(handle_callback)],
+        WAITING_FOR_GROUP_URLS: [MessageHandler(Filters.text & ~Filters.command, process_group_urls)],
+        WAITING_FOR_GROUP_LINKS: [MessageHandler(Filters.text & ~Filters.command, process_group_links)],
         WAITING_FOR_FOLDER_NAME: [MessageHandler(Filters.text & ~Filters.command, process_folder_name)],
+        WAITING_FOR_FOLDER_CHOICE: [CallbackQueryHandler(handle_callback)],
         WAITING_FOR_FOLDER_SELECTION: [CallbackQueryHandler(handle_callback)],
+        WAITING_FOR_FOLDER_ACTION: [CallbackQueryHandler(handle_callback)],
+        WAITING_FOR_PRIMARY_MESSAGE_LINK: [MessageHandler(Filters.text & ~Filters.command, process_primary_message_link)],
+        WAITING_FOR_FALLBACK_MESSAGE_LINK: [MessageHandler(Filters.text & ~Filters.command, process_fallback_message_link)],
+        WAITING_FOR_START_TIME: [MessageHandler(Filters.text & ~Filters.command, process_start_time)],
         TASK_SETUP: [CallbackQueryHandler(handle_callback)],
-        WAITING_FOR_LANGUAGE: [CallbackQueryHandler(handle_callback)],
+        SELECT_TARGET_GROUPS: [CallbackQueryHandler(handle_callback)],
         WAITING_FOR_EXTEND_CODE: [MessageHandler(Filters.text & ~Filters.command, process_extend_code)],
         WAITING_FOR_EXTEND_DAYS: [MessageHandler(Filters.text & ~Filters.command, process_extend_days)],
         WAITING_FOR_ADD_USERBOTS_CODE: [MessageHandler(Filters.text & ~Filters.command, process_add_userbots_code)],
         WAITING_FOR_ADD_USERBOTS_COUNT: [MessageHandler(Filters.text & ~Filters.command, process_add_userbots_count)],
-        SELECT_TARGET_GROUPS: [CallbackQueryHandler(handle_callback)],
         WAITING_FOR_USERBOT_SELECTION: [CallbackQueryHandler(handle_callback)],
-        WAITING_FOR_GROUP_LINKS: [MessageHandler(Filters.text & ~Filters.command, process_group_links)],
-        WAITING_FOR_FOLDER_ACTION: [CallbackQueryHandler(handle_callback)],
-        WAITING_FOR_PRIMARY_MESSAGE_LINK: [MessageHandler(Filters.text & ~Filters.command, process_primary_message_link)],
-        WAITING_FOR_FALLBACK_MESSAGE_LINK: [
-            MessageHandler(Filters.text & ~Filters.command, process_fallback_message_link),
-            CallbackQueryHandler(handle_callback, pattern=r'^add_fallback_.*|^back_to_task_setup_.*')
-        ],
-        WAITING_FOR_START_TIME: [MessageHandler(Filters.text & ~Filters.command, process_start_time)],
     },
-    fallbacks=[CommandHandler('start', start)]
+    fallbacks=[CommandHandler('start', start), CommandHandler('admin', admin_panel)]
 )
 
 dp.add_handler(conv_handler)
 
+# Background task to check and execute scheduled tasks
+async def check_tasks():
+    while True:
+        try:
+            current_time = int(datetime.now(utc_tz).timestamp())
+            with db_lock:
+                cursor.execute("SELECT client_id, userbot_phone, message_link, fallback_message_link, start_time, repetition_interval, folder_id, send_to_all_groups, last_run FROM userbot_settings WHERE status = 'active'")
+                tasks = cursor.fetchall()
+            for task in tasks:
+                client_id, phone, message_link, fallback_message_link, start_time, interval, folder_id, send_to_all, last_run = task
+                if not message_link:
+                    continue
+                if start_time > current_time:
+                    continue
+                if last_run and (current_time - last_run < interval * 60):
+                    continue
+                client, loop, lock = get_userbot_client(phone)
+                if not client:
+                    log_event("Task Error", f"Phone: {phone}, Error: Client not initialized")
+                    continue
+                async with lock:
+                    await client.start()
+                    try:
+                        if send_to_all:
+                            dialogs = await client.get_dialogs()
+                            target_groups = [dialog.entity for dialog in dialogs if dialog.is_group]
+                        else:
+                            with db_lock:
+                                cursor.execute("SELECT group_id FROM target_groups WHERE folder_id = ?", (folder_id,))
+                                group_ids = [row[0] for row in cursor.fetchall()]
+                            target_groups = [PeerChannel(gid) for gid in group_ids]
+                        if not target_groups:
+                            continue
+                        chat, message_id = await get_message_from_link(client, message_link)
+                        success_count = 0
+                        for target in target_groups:
+                            try:
+                                await client.forward_messages(target, message_id, chat)
+                                success_count += 1
+                            except FloodWaitError as e:
+                                await asyncio.sleep(e.seconds)
+                            except ChatSendMediaForbiddenError:
+                                if fallback_message_link:
+                                    chat_fb, msg_id_fb = await get_message_from_link(client, fallback_message_link)
+                                    await client.forward_messages(target, msg_id_fb, chat_fb)
+                                    success_count += 1
+                            except Exception as e:
+                                log_event("Forward Error", f"Phone: {phone}, Target: {target}, Error: {e}")
+                        with db_lock:
+                            cursor.execute("UPDATE userbot_settings SET last_run = ? WHERE client_id = ? AND userbot_phone = ?", (current_time, client_id, phone))
+                            cursor.execute("UPDATE clients SET total_messages_sent = total_messages_sent + ?, groups_reached = groups_reached + ? WHERE user_id = ?", (success_count, len(target_groups), client_id))
+                            db.commit()
+                        log_event("Task Executed", f"Phone: {phone}, Messages Sent: {success_count}, Groups: {len(target_groups)}")
+                    finally:
+                        await client.disconnect()
+        except Exception as e:
+            log_event("Task Check Error", f"Error: {e}")
+        await asyncio.sleep(CHECK_TASKS_INTERVAL)
+
+# Start the background task
+asyncio.run_coroutine_threadsafe(check_tasks(), async_loop)
+
 # Start the bot
-updater.start_polling()
-updater.idle()
+if __name__ == "__main__":
+    updater.start_polling()
+    updater.idle()
