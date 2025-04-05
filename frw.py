@@ -90,7 +90,7 @@ dp = updater.dispatcher
 userbots = {}
 userbots_lock = threading.Lock()
 
-# Conversation states
+# Conversation states (updated with new states for primary and fallback message links)
 (
     WAITING_FOR_CODE, WAITING_FOR_PHONE, WAITING_FOR_API_ID, WAITING_FOR_API_HASH,
     WAITING_FOR_CODE_USERBOT, WAITING_FOR_PASSWORD, WAITING_FOR_SUB_DETAILS,
@@ -99,8 +99,9 @@ userbots_lock = threading.Lock()
     WAITING_FOR_FOLDER_SELECTION, TASK_SETUP, WAITING_FOR_LANGUAGE,
     WAITING_FOR_EXTEND_CODE, WAITING_FOR_EXTEND_DAYS,
     WAITING_FOR_ADD_USERBOTS_CODE, WAITING_FOR_ADD_USERBOTS_COUNT, SELECT_TARGET_GROUPS,
-    WAITING_FOR_USERBOT_SELECTION, WAITING_FOR_GROUP_LINKS, WAITING_FOR_FOLDER_ACTION
-) = range(24)
+    WAITING_FOR_USERBOT_SELECTION, WAITING_FOR_GROUP_LINKS, WAITING_FOR_FOLDER_ACTION,
+    WAITING_FOR_PRIMARY_MESSAGE_LINK, WAITING_FOR_FALLBACK_MESSAGE_LINK
+) = range(26)  # Updated range to 26 to accommodate new states
 
 # Translations dictionary
 translations = {
@@ -136,7 +137,7 @@ def get_text(user_id, key, **kwargs):
     text = translations.get(lang, translations['en']).get(key, translations['en'].get(key, key))
     return text.format(**kwargs)
 
-# Database initialization
+# Database initialization (updated to include fallback_message_link)
 try:
     with db_lock:
         cursor.executescript('''
@@ -197,6 +198,7 @@ try:
                 client_id INTEGER,
                 userbot_phone TEXT,
                 message_link TEXT,
+                fallback_message_link TEXT,  -- Added new column for fallback message link
                 start_time INTEGER,
                 repetition_interval INTEGER,
                 status TEXT CHECK(status IN ('active', 'inactive')) DEFAULT 'active',
@@ -516,7 +518,7 @@ async def join_existing_target_groups(client, lock, user_id, phone):
             else:
                 return 0, 0
         except Exception as e:
-            log_event("Join Error", f"User дал: {user_id}, Phone: {phone}, Error: {e}")
+            log_event("Join Error", f"User: {user_id}, Phone: {phone}, Error: {e}")
             print(f"Error in join_existing_target_groups for user {user_id}: {e}")
             return 0, 0
 
@@ -932,22 +934,25 @@ def handle_callback(update: Update, context):
             context.user_data['setting_phone'] = phone
             task_config = context.user_data.get(f'task_config_{phone}', {})
             with db_lock:
-                cursor.execute("SELECT message_link, start_time, repetition_interval, status, folder_id, send_to_all_groups FROM userbot_settings WHERE client_id = ? AND userbot_phone = ?", (user_id, phone))
+                cursor.execute("SELECT message_link, fallback_message_link, start_time, repetition_interval, status, folder_id, send_to_all_groups FROM userbot_settings WHERE client_id = ? AND userbot_phone = ?", (user_id, phone))
                 settings = cursor.fetchone()
                 logging.info(f"Retrieved settings for {phone}: {settings}")
             if settings:
                 task_config.update({
                     'message_link': settings[0],
-                    'start_time': settings[1],
-                    'repetition_interval': settings[2],
-                    'status': settings[3],
-                    'folder_id': settings[4],
-                    'send_to_all_groups': settings[5]
+                    'fallback_message_link': settings[1],
+                    'start_time': settings[2],
+                    'repetition_interval': settings[3],
+                    'status': settings[4],
+                    'folder_id': settings[5],
+                    'send_to_all_groups': settings[6]
                 })
             if 'folder_id' not in task_config:
                 task_config['folder_id'] = None
             if 'message_link' not in task_config:
                 task_config['message_link'] = None
+            if 'fallback_message_link' not in task_config:
+                task_config['fallback_message_link'] = None
             if 'start_time' not in task_config:
                 task_config['start_time'] = None
             if 'repetition_interval' not in task_config:
@@ -967,7 +972,8 @@ def handle_callback(update: Update, context):
                 username = result[0] if result and result[0] else None
             display_name = f"@{username}" if username else f"{phone} (no username set)"
             message = (f"Task Settings for {display_name}:\n"
-                       f"Message: {task_config['message_link'] or 'Not set'}\n"
+                       f"Primary Message: {task_config['message_link'] or 'Not set'}\n"
+                       f"Fallback Message: {task_config['fallback_message_link'] or 'Not set'}\n"
                        f"Start Time: {format_lithuanian_time(task_config['start_time'])}\n"
                        f"Interval: {format_interval(task_config['repetition_interval'])}\n"
                        f"Target: {'All Groups' if task_config['send_to_all_groups'] else folder_name}\n"
@@ -1007,7 +1013,8 @@ def handle_callback(update: Update, context):
                 username = result[0] if result and result[0] else None
             display_name = f"@{username}" if username else f"{phone} (no username set)"
             message = (f"Task Settings for {display_name}:\n"
-                       f"Message: {task_config['message_link'] or 'Not set'}\n"
+                       f"Primary Message: {task_config['message_link'] or 'Not set'}\n"
+                       f"Fallback Message: {task_config['fallback_message_link'] or 'Not set'}\n"
                        f"Start Time: {format_lithuanian_time(task_config['start_time'])}\n"
                        f"Interval: {format_interval(task_config['repetition_interval'])}\n"
                        f"Target: All Groups\n"
@@ -1055,7 +1062,8 @@ def handle_callback(update: Update, context):
                 username = result[0] if result and result[0] else None
             display_name = f"@{username}" if username else f"{phone} (no username set)"
             message = (f"Task Settings for {display_name}:\n"
-                       f"Message: {task_config['message_link'] or 'Not set'}\n"
+                       f"Primary Message: {task_config['message_link'] or 'Not set'}\n"
+                       f"Fallback Message: {task_config['fallback_message_link'] or 'Not set'}\n"
                        f"Start Time: {format_lithuanian_time(task_config['start_time'])}\n"
                        f"Interval: {format_interval(task_config['repetition_interval'])}\n"
                        f"Target: {folder_name}\n"
@@ -1077,8 +1085,8 @@ def handle_callback(update: Update, context):
             context.user_data['setting_phone'] = phone
             keyboard = [[InlineKeyboardButton("Back to Task Setup", callback_data=f"back_to_task_setup_{phone}")]]
             markup = InlineKeyboardMarkup(keyboard)
-            query.edit_message_text("Send the message link (e.g., https://t.me/c/123456789/10):", reply_markup=markup)
-            return WAITING_FOR_MESSAGE_LINK
+            query.edit_message_text("Send the primary message link (e.g., https://t.me/c/123456789/10):", reply_markup=markup)
+            return WAITING_FOR_PRIMARY_MESSAGE_LINK
 
         elif data.startswith("set_time_"):
             phone = data.split("_")[2]
@@ -1118,7 +1126,8 @@ def handle_callback(update: Update, context):
                 username = result[0] if result and result[0] else None
             display_name = f"@{username}" if username else f"{phone} (no username set)"
             message = (f"Task Settings for {display_name}:\n"
-                       f"Message: {task_config['message_link'] or 'Not set'}\n"
+                       f"Primary Message: {task_config['message_link'] or 'Not set'}\n"
+                       f"Fallback Message: {task_config['fallback_message_link'] or 'Not set'}\n"
                        f"Start Time: {format_lithuanian_time(task_config['start_time'])}\n"
                        f"Interval: {format_interval(task_config['repetition_interval'])}\n"
                        f"Target: {'All Groups' if task_config['send_to_all_groups'] else folder_name}\n"
@@ -1149,7 +1158,8 @@ def handle_callback(update: Update, context):
                 username = result[0] if result and result[0] else None
             display_name = f"@{username}" if username else f"{phone} (no username set)"
             message = (f"Task Settings for {display_name}:\n"
-                       f"Message: {task_config['message_link'] or 'Not set'}\n"
+                       f"Primary Message: {task_config['message_link'] or 'Not set'}\n"
+                       f"Fallback Message: {task_config['fallback_message_link'] or 'Not set'}\n"
                        f"Start Time: {format_lithuanian_time(task_config['start_time'])}\n"
                        f"Interval: {format_interval(task_config['repetition_interval'])}\n"
                        f"Target: {'All Groups' if task_config['send_to_all_groups'] else folder_name}\n"
@@ -1173,8 +1183,8 @@ def handle_callback(update: Update, context):
                 query.edit_message_text("Please select a folder or choose to send to all groups.")
                 return TASK_SETUP
             with db_lock:
-                cursor.execute("INSERT OR REPLACE INTO userbot_settings (client_id, userbot_phone, message_link, start_time, repetition_interval, status, folder_id, send_to_all_groups) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                               (user_id, phone, task_config['message_link'], task_config['start_time'], task_config['repetition_interval'], task_config['status'], task_config['folder_id'], task_config['send_to_all_groups']))
+                cursor.execute("INSERT OR REPLACE INTO userbot_settings (client_id, userbot_phone, message_link, fallback_message_link, start_time, repetition_interval, status, folder_id, send_to_all_groups) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                               (user_id, phone, task_config['message_link'], task_config['fallback_message_link'], task_config['start_time'], task_config['repetition_interval'], task_config['status'], task_config['folder_id'], task_config['send_to_all_groups']))
                 db.commit()
             client, loop, lock = get_userbot_client(phone)
             if client and not task_config['send_to_all_groups'] and task_config['folder_id']:
@@ -1203,7 +1213,8 @@ def handle_callback(update: Update, context):
                 username = result[0] if result and result[0] else None
             display_name = f"@{username}" if username else f"{phone} (no username set)"
             message = (f"Task Settings for {display_name}:\n"
-                       f"Message: {task_config.get('message_link', 'Not set')}\n"
+                       f"Primary Message: {task_config.get('message_link', 'Not set')}\n"
+                       f"Fallback Message: {task_config.get('fallback_message_link', 'Not set')}\n"
                        f"Start Time: {format_lithuanian_time(task_config.get('start_time'))}\n"
                        f"Interval: {format_interval(task_config.get('repetition_interval'))}\n"
                        f"Target: {'All Groups' if task_config.get('send_to_all_groups') else folder_name}\n"
@@ -1669,7 +1680,7 @@ def process_group_links(update: Update, context):
         update.message.reply_text(f"Error: {str(e)}. Please try again.")
         return ConversationHandler.END
 
-def process_message_link(update: Update, context):
+def process_primary_message_link(update: Update, context):
     user_id = update.effective_user.id
     try:
         link = update.message.text.strip()
@@ -1680,9 +1691,30 @@ def process_message_link(update: Update, context):
             (link.startswith("https://t.me/") and len(parts) == 5 and parts[4].isdigit())
         ):
             update.message.reply_text("Invalid message link format. Please provide a valid link.")
-            return WAITING_FOR_MESSAGE_LINK
+            return WAITING_FOR_PRIMARY_MESSAGE_LINK
         task_config = context.user_data[f'task_config_{phone}']
         task_config['message_link'] = link
+        update.message.reply_text("Now, send the fallback text-only message link (e.g., https://t.me/c/123456789/11):")
+        return WAITING_FOR_FALLBACK_MESSAGE_LINK
+    except Exception as e:
+        log_event("Primary Message Link Error", f"Phone: {phone}, User: {user_id}, Error: {e}")
+        update.message.reply_text(f"Error: {str(e)}. Please try again.")
+        return WAITING_FOR_PRIMARY_MESSAGE_LINK
+
+def process_fallback_message_link(update: Update, context):
+    user_id = update.effective_user.id
+    try:
+        link = update.message.text.strip()
+        phone = context.user_data['setting_phone']
+        parts = link.split('/')
+        if not (
+            (link.startswith("https://t.me/c/") and len(parts) == 6 and parts[4].isdigit() and parts[5].isdigit()) or
+            (link.startswith("https://t.me/") and len(parts) == 5 and parts[4].isdigit())
+        ):
+            update.message.reply_text("Invalid message link format. Please provide a valid link.")
+            return WAITING_FOR_FALLBACK_MESSAGE_LINK
+        task_config = context.user_data[f'task_config_{phone}']
+        task_config['fallback_message_link'] = link
         with db_lock:
             cursor.execute("SELECT name FROM folders WHERE id = ?", (task_config['folder_id'],))
             result = cursor.fetchone()
@@ -1693,7 +1725,8 @@ def process_message_link(update: Update, context):
             username = result[0] if result and result[0] else None
         display_name = f"@{username}" if username else f"{phone} (no username set)"
         message = (f"Task Settings for {display_name}:\n"
-                   f"Message: {task_config['message_link'] or 'Not set'}\n"
+                   f"Primary Message: {task_config['message_link'] or 'Not set'}\n"
+                   f"Fallback Message: {task_config['fallback_message_link'] or 'Not set'}\n"
                    f"Start Time: {format_lithuanian_time(task_config['start_time'])}\n"
                    f"Interval: {format_interval(task_config['repetition_interval'])}\n"
                    f"Target: {'All Groups' if task_config['send_to_all_groups'] else folder_name}\n"
@@ -1710,9 +1743,9 @@ def process_message_link(update: Update, context):
         update.message.reply_text(message, reply_markup=markup)
         return TASK_SETUP
     except Exception as e:
-        log_event("Message Link Error", f"Phone: {phone}, User: {user_id}, Error: {e}")
+        log_event("Fallback Message Link Error", f"Phone: {phone}, User: {user_id}, Error: {e}")
         update.message.reply_text(f"Error: {str(e)}. Please try again.")
-        return WAITING_FOR_MESSAGE_LINK
+        return WAITING_FOR_FALLBACK_MESSAGE_LINK
 
 def process_start_time(update: Update, context):
     user_id = update.effective_user.id
@@ -1735,7 +1768,8 @@ def process_start_time(update: Update, context):
             username = result[0] if result and result[0] else None
         display_name = f"@{username}" if username else f"{phone} (no username set)"
         message = (f"Task Settings for {display_name}:\n"
-                   f"Message: {task_config['message_link'] or 'Not set'}\n"
+                   f"Primary Message: {task_config['message_link'] or 'Not set'}\n"
+                   f"Fallback Message: {task_config['fallback_message_link'] or 'Not set'}\n"
                    f"Start Time: {format_lithuanian_time(task_config['start_time'])}\n"
                    f"Interval: {format_interval(task_config['repetition_interval'])}\n"
                    f"Target: {'All Groups' if task_config['send_to_all_groups'] else folder_name}\n"
@@ -1930,7 +1964,7 @@ async def forward_task(bot, user_id, phone):
             await client.start()
             try:
                 with db_lock:
-                    cursor.execute("SELECT message_link, start_time, repetition_interval, status, folder_id, send_to_all_groups FROM userbot_settings WHERE client_id = ? AND userbot_phone = ?",
+                    cursor.execute("SELECT message_link, fallback_message_link, start_time, repetition_interval, status, folder_id, send_to_all_groups FROM userbot_settings WHERE client_id = ? AND userbot_phone = ?",
                                    (user_id, phone))
                     settings = cursor.fetchone()
                 if not settings:
@@ -1941,7 +1975,7 @@ async def forward_task(bot, user_id, phone):
                     display_name = f"@{username}" if username else f"{phone} (no username set)"
                     logging.info(f"No settings found for userbot {display_name} for user {user_id}")
                     return
-                message_link, start_time, repetition_interval, status, folder_id, send_to_all_groups = settings
+                message_link, fallback_message_link, start_time, repetition_interval, status, folder_id, send_to_all_groups = settings
                 if not all([message_link, start_time, repetition_interval]) or status != 'active':
                     with db_lock:
                         cursor.execute("SELECT username FROM userbots WHERE phone_number = ?", (phone,))
@@ -1960,6 +1994,11 @@ async def forward_task(bot, user_id, phone):
                 try:
                     entity, message_id = await get_message_from_link(client, message_link)
                     message = await client.get_messages(entity, ids=message_id)
+                    if fallback_message_link:
+                        fallback_entity, fallback_message_id = await get_message_from_link(client, fallback_message_link)
+                        fallback_message = await client.get_messages(fallback_entity, ids=fallback_message_id)
+                    else:
+                        fallback_entity, fallback_message_id = None, None
                 except ValueError as e:
                     log_event("Forwarding Error", f"User: {user_id}, Userbot: {phone}, Error: Invalid message link - {e}")
                     with db_lock:
@@ -2003,12 +2042,19 @@ async def forward_task(bot, user_id, phone):
                         await client.forward_messages(PeerChannel(group_id), message_id, entity)
                         successful_groups += 1
                     except ChatSendMediaForbiddenError:
-                        if message.text:
+                        if fallback_message_link and fallback_entity and fallback_message_id:
+                            try:
+                                await client.forward_messages(PeerChannel(group_id), fallback_message_id, fallback_entity)
+                                successful_groups += 1
+                                logging.info(f"Forwarded fallback message to group {group_id}")
+                            except Exception as e:
+                                log_event("Forwarding Fallback Error", f"User: {user_id}, Userbot: {phone}, Group: {group_id}, Error: {e}")
+                        elif message.text:
                             await client.send_message(PeerChannel(group_id), message.text)
                             successful_groups += 1
                             logging.info(f"Sent text-only message to group {group_id} due to media restriction")
                         else:
-                            logging.warning(f"Message has no text to send to group {group_id}")
+                            logging.warning(f"Message has no text or fallback to send to group {group_id}")
                     except FloodWaitError as e:
                         wait_time = e.seconds
                         with db_lock:
@@ -2066,8 +2112,9 @@ def check_tasks(bot):
                 cursor.execute("SELECT user_id, dedicated_userbots, subscription_end FROM clients WHERE subscription_end > ?",
                                (int(datetime.now(utc_tz).timestamp()),))
                 clients = cursor.fetchall()
+            logging.info(f"Checking tasks for {len(clients)} active clients")
             for user_id, userbot_phones, sub_end in clients:
-                logging.info(f"User {user_id} subscription ends at {sub_end} ({datetime.fromtimestamp(sub_end, utc_tz)})")
+                logging.info(f"User {user_id} has {len(userbot_phones.split(','))} userbots, subscription ends at {sub_end} ({datetime.fromtimestamp(sub_end, utc_tz)})")
                 if userbot_phones:
                     for phone in userbot_phones.split(","):
                         client, client_loop, lock = get_userbot_client(phone)
@@ -2090,56 +2137,3 @@ def check_tasks(bot):
             log_event("Check Tasks Error", f"Error: {e}")
 
 # Global async loop for initialization
-async_loop = asyncio.new_event_loop()
-def run_async_loop():
-    asyncio.set_event_loop(async_loop)
-    async_loop.run_forever()
-threading.Thread(target=run_async_loop, daemon=True).start()
-
-# Conversation handler
-conv_handler = ConversationHandler(
-    entry_points=[
-        CommandHandler("start", start),
-        CommandHandler("admin", admin_panel),
-        CommandHandler("menu", client_menu),
-        CallbackQueryHandler(handle_callback),
-    ],
-    states={
-        WAITING_FOR_CODE: [MessageHandler(Filters.text & ~Filters.command, process_invitation_code)],
-        WAITING_FOR_PHONE: [MessageHandler(Filters.text & ~Filters.command, get_phone_number)],
-        WAITING_FOR_API_ID: [MessageHandler(Filters.text & ~Filters.command, get_api_id)],
-        WAITING_FOR_API_HASH: [MessageHandler(Filters.text & ~Filters.command, get_api_hash)],
-        WAITING_FOR_CODE_USERBOT: [MessageHandler(Filters.text & ~Filters.command, get_code)],
-        WAITING_FOR_PASSWORD: [MessageHandler(Filters.text & ~Filters.command, get_password)],
-        WAITING_FOR_SUB_DETAILS: [MessageHandler(Filters.text & ~Filters.command, process_generate_invite)],
-        WAITING_FOR_GROUP_URLS: [MessageHandler(Filters.text & ~Filters.command, process_add_group)],
-        WAITING_FOR_MESSAGE_LINK: [MessageHandler(Filters.text & ~Filters.command, process_message_link)],
-        WAITING_FOR_START_TIME: [MessageHandler(Filters.text & ~Filters.command, process_start_time)],
-        WAITING_FOR_TARGET_GROUP: [MessageHandler(Filters.text & ~Filters.command, process_target_group)],
-        WAITING_FOR_FOLDER_CHOICE: [CallbackQueryHandler(handle_callback)],
-        WAITING_FOR_FOLDER_NAME: [MessageHandler(Filters.text & ~Filters.command, process_folder_name)],
-        WAITING_FOR_FOLDER_SELECTION: [CallbackQueryHandler(handle_callback)],
-        TASK_SETUP: [CallbackQueryHandler(handle_callback)],
-        WAITING_FOR_LANGUAGE: [CallbackQueryHandler(handle_callback)],
-        WAITING_FOR_EXTEND_CODE: [MessageHandler(Filters.text & ~Filters.command, process_extend_code)],
-        WAITING_FOR_EXTEND_DAYS: [MessageHandler(Filters.text & ~Filters.command, process_extend_days)],
-        WAITING_FOR_ADD_USERBOTS_CODE: [MessageHandler(Filters.text & ~Filters.command, process_add_userbots_code)],
-        WAITING_FOR_ADD_USERBOTS_COUNT: [MessageHandler(Filters.text & ~Filters.command, process_add_userbots_count)],
-        SELECT_TARGET_GROUPS: [CallbackQueryHandler(handle_callback)],
-        WAITING_FOR_USERBOT_SELECTION: [CallbackQueryHandler(handle_callback)],
-        WAITING_FOR_GROUP_LINKS: [MessageHandler(Filters.text & ~Filters.command, process_group_links)],
-        WAITING_FOR_FOLDER_ACTION: [CallbackQueryHandler(handle_callback)],
-    },
-    fallbacks=[CommandHandler('cancel', cancel)],
-    allow_reentry=True,
-)
-
-# Register handlers
-dp.add_handler(conv_handler)
-
-# Start background task
-threading.Thread(target=check_tasks, args=(updater.bot,), daemon=True).start()
-
-# Start the bot
-updater.start_polling()
-updater.idle()
