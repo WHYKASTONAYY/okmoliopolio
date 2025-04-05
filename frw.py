@@ -1586,11 +1586,20 @@ def process_primary_message_link(update: Update, context):
         if not phone:
             update.message.reply_text("Userbot not selected. Please start over.")
             return ConversationHandler.END
-        client, loop, _ = get_userbot_client(phone)
+        client, loop, lock = get_userbot_client(phone)
         if not client:
             update.message.reply_text(f"Failed to initialize userbot {phone}.")
             return ConversationHandler.END
-        asyncio.run_coroutine_threadsafe(get_message_from_link(client, link), loop).result()
+        
+        async def process_link():
+            async with lock:
+                await client.start()
+                try:
+                    await get_message_from_link(client, link)
+                finally:
+                    await client.disconnect()
+        
+        asyncio.run_coroutine_threadsafe(process_link(), loop).result()
         task_config = context.user_data[f'task_config_{phone}']
         task_config['message_link'] = link
         update.message.reply_text("Primary message link set. Now send the fallback message link (or type 'skip' to skip):")
@@ -1612,12 +1621,22 @@ def process_fallback_message_link(update: Update, context):
         if text.lower() == 'skip':
             task_config['fallback_message_link'] = None
         else:
-            client, loop, _ = get_userbot_client(phone)
+            client, loop, lock = get_userbot_client(phone)
             if not client:
                 update.message.reply_text(f"Failed to initialize userbot {phone}.")
                 return ConversationHandler.END
-            asyncio.run_coroutine_threadsafe(get_message_from_link(client, text), loop).result()
+            
+            async def process_fallback_link():
+                async with lock:
+                    await client.start()
+                    try:
+                        await get_message_from_link(client, text)
+                    finally:
+                        await client.disconnect()
+            
+            asyncio.run_coroutine_threadsafe(process_fallback_link(), loop).result()
             task_config['fallback_message_link'] = text
+        
         with db_lock:
             cursor.execute("SELECT name FROM folders WHERE id = ?", (task_config['folder_id'],))
             result = cursor.fetchone()
