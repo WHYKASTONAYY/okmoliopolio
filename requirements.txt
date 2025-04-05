@@ -1,4 +1,4 @@
-python-telegram-bot==20.0
-telethon
-pytz
-filetype
+python-telegram-bot==20.7
+telethon==1.36.0
+pytz==2024.1
+filetype==1.2.0
