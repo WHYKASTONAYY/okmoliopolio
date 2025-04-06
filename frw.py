@@ -38,6 +38,15 @@ def what(file, h=None):
 imghdr_module.what = what
 sys.modules['imghdr'] = imghdr_module
 
+# Data directory setup for persistent storage on Render.com
+DATA_DIR = os.environ.get('DATA_DIR', './data')
+if not os.path.exists(DATA_DIR):
+    os.makedirs(DATA_DIR)
+DB_PATH = os.path.join(DATA_DIR, 'telegram_bot.db')
+SESSION_DIR = os.path.join(DATA_DIR, 'sessions')
+if not os.path.exists(SESSION_DIR):
+    os.makedirs(SESSION_DIR)
+
 # Configuration from environment variables with validation
 def load_env_var(name, required=True, cast=str):
     """Load an environment variable with type casting and validation."""
@@ -51,26 +60,22 @@ API_HASH = load_env_var('API_HASH')
 BOT_TOKEN = load_env_var('BOT_TOKEN')
 ADMIN_IDS = [int(id_) for id_ in load_env_var('ADMIN_IDS', False, str).split(',') if id_] if load_env_var('ADMIN_IDS', False) else []
 
-# Ensure data directories exist
-if not os.path.exists("./data/sessions"):
-    os.makedirs("./data/sessions")
-
 # Database setup with persistent storage
-db = sqlite3.connect('./data/telegram_bot.db', check_same_thread=False)
+db = sqlite3.connect(DB_PATH, check_same_thread=False)
 cursor = db.cursor()
 db_lock = threading.RLock()
 
-# Logging setup
+# Logging setup for Render.com (file and stdout)
 logging.basicConfig(
     level=logging.DEBUG,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('bot.log'),
-        logging.StreamHandler()  # Output to stdout
+        logging.FileHandler(os.path.join(DATA_DIR, 'bot.log')),
+        logging.StreamHandler()  # Output to stdout for Render.com logs
     ]
 )
 
-# Signal handler for graceful shutdown
+# Signal handler for graceful shutdown on Render.com
 def shutdown(signum, frame):
     """Handle shutdown signals to close resources gracefully."""
     logging.info("Shutting down...")
@@ -207,7 +212,7 @@ try:
         ''')
         db.commit()
 except sqlite3.Error as e:
-    print(f"Database setup failed: {e}")
+    logging.error(f"Database setup failed: {e}")
     raise
 
 # Time zone setup
@@ -332,10 +337,10 @@ def get_userbot_client(phone_number):
                     thread.start()
                     # Create the client with this loop
                     future = asyncio.run_coroutine_threadsafe(
-                        create_client(session_file, api_id, api_hash, loop), loop
+                        create_client(os.path.join(SESSION_DIR, f"{phone_number}.session"), api_id, api_hash, loop), loop
                     )
                     client = future.result(timeout=10)
-                    lock = asyncio.Lock(loop=loop)
+                    lock = asyncio.Lock()  # Removed loop parameter for Python 3.10+ compatibility
                     userbots[phone_number] = (client, loop, lock, thread)
                 return userbots[phone_number]
         return None, None, None, None
@@ -1351,7 +1356,7 @@ def get_api_hash(update: Update, context):
         
         phone = context.user_data.get('phone')
         api_id = context.user_data.get('api_id')
-        session_file = f"./data/sessions/{phone}.session"
+        session_file = os.path.join(SESSION_DIR, f"{phone}.session")
         
         context.user_data['api_hash'] = api_hash
         
