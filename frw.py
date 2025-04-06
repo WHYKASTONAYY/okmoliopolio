@@ -75,9 +75,13 @@ def shutdown(signum, frame):
     """Handle shutdown signals to close resources gracefully."""
     logging.info("Shutting down...")
     db.close()
-    for client, loop, lock in userbots.values():
-        asyncio.run_coroutine_threadsafe(client.disconnect(), loop)
-        loop.call_soon_threadsafe(loop.stop)
+    with userbots_lock:
+        for phone, (client, loop, lock, thread) in userbots.items():
+            asyncio.run_coroutine_threadsafe(client.disconnect(), loop)
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)  # Give the thread time to stop
+            if thread.is_alive():
+                logging.warning(f"Thread for {phone} did not stop gracefully.")
     sys.exit(0)
 
 signal.signal(signal.SIGTERM, shutdown)
@@ -224,8 +228,8 @@ async def async_sign_in_with_password(client, password):
 async def async_disconnect(client):
     await client.disconnect()
 
-async def create_client(session_file, api_id, api_hash):
-    client = TelegramClient(session_file, api_id, api_hash, timeout=CLIENT_TIMEOUT)
+async def create_client(session_file, api_id, api_hash, loop):
+    client = TelegramClient(session_file, api_id, api_hash, timeout=CLIENT_TIMEOUT, loop=loop)
     return client
 
 # Utility functions
@@ -309,7 +313,7 @@ async def get_chat_from_link(client, link):
     raise ValueError("Invalid link")
 
 def get_userbot_client(phone_number):
-    """Retrieve or create a TelegramClient instance for a userbot."""
+    """Retrieve or create a TelegramClient instance for a userbot with its own event loop."""
     try:
         with db_lock:
             cursor.execute("SELECT api_id, api_hash, session_file FROM userbots WHERE phone_number = ?", (phone_number,))
@@ -318,26 +322,26 @@ def get_userbot_client(phone_number):
             api_id, api_hash, session_file = result
             with userbots_lock:
                 if phone_number not in userbots:
+                    # Create a new event loop for this client
                     loop = asyncio.new_event_loop()
+                    # Start the loop in a separate thread
                     def run_loop():
                         asyncio.set_event_loop(loop)
                         loop.run_forever()
                     thread = threading.Thread(target=run_loop, daemon=True)
                     thread.start()
+                    # Create the client with this loop
                     future = asyncio.run_coroutine_threadsafe(
-                        create_client(session_file, api_id, api_hash), loop
+                        create_client(session_file, api_id, api_hash, loop), loop
                     )
-                    client = future.result()
-                    async def create_lock():
-                        return asyncio.Lock()
-                    lock_future = asyncio.run_coroutine_threadsafe(create_lock(), loop)
-                    lock = lock_future.result()
-                    userbots[phone_number] = (client, loop, lock)
+                    client = future.result(timeout=10)
+                    lock = asyncio.Lock(loop=loop)
+                    userbots[phone_number] = (client, loop, lock, thread)
                 return userbots[phone_number]
-        return None, None, None
+        return None, None, None, None
     except Exception as e:
         log_event("Get Userbot Client Error", f"Phone: {phone_number}, Error: {e}")
-        return None, None, None
+        return None, None, None, None
 
 async def check_membership(client, group_id):
     try:
@@ -663,7 +667,7 @@ def handle_callback(update: Update, context):
 
         elif data.startswith("view_joined_"):
             phone = data.split("_")[2]
-            client, loop, lock = get_userbot_client(phone)
+            client, loop, lock, _ = get_userbot_client(phone)
             if not client:
                 query.edit_message_text(f"Failed to initialize userbot {phone}.")
                 return ConversationHandler.END
@@ -843,9 +847,12 @@ def handle_callback(update: Update, context):
                 db.commit()
             with userbots_lock:
                 if phone in userbots:
-                    client, loop, _ = userbots.pop(phone)
+                    client, loop, _, thread = userbots.pop(phone)
                     asyncio.run_coroutine_threadsafe(client.disconnect(), loop)
                     loop.call_soon_threadsafe(loop.stop)
+                    thread.join(timeout=5)
+                    if thread.is_alive():
+                        logging.warning(f"Thread for {phone} did not stop gracefully.")
             log_event("Userbot Removed", f"Phone: {phone}")
             notify_admins(context.bot, f"Userbot {display_name} removed.")
             query.edit_message_text(f"Userbot {display_name} removed.")
@@ -1193,7 +1200,7 @@ def handle_callback(update: Update, context):
                 cursor.execute("INSERT OR REPLACE INTO userbot_settings (client_id, userbot_phone, message_link, fallback_message_link, start_time, repetition_interval, status, folder_id, send_to_all_groups) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
                                (user_id, phone, task_config['message_link'], task_config['fallback_message_link'], task_config['start_time'], task_config['repetition_interval'], task_config['status'], task_config['folder_id'], task_config['send_to_all_groups']))
                 db.commit()
-            client, loop, lock = get_userbot_client(phone)
+            client, loop, lock, _ = get_userbot_client(phone)
             if client and not task_config['send_to_all_groups'] and task_config['folder_id']:
                 asyncio.run_coroutine_threadsafe(join_target_groups(client, lock, task_config['folder_id'], phone), loop)
             with db_lock:
@@ -1352,22 +1359,37 @@ def get_api_hash(update: Update, context):
             os.remove(session_file)
             logging.info(f"Removed existing session file for {phone}")
         
-        future = asyncio.run_coroutine_threadsafe(create_client(session_file, api_id, api_hash), async_loop)
+        # Create a new event loop for this client
+        loop = asyncio.new_event_loop()
+        # Start the loop in a separate thread
+        def run_loop():
+            asyncio.set_event_loop(loop)
+            loop.run_forever()
+        thread = threading.Thread(target=run_loop, daemon=True)
+        thread.start()
+        # Create the client with this loop
+        future = asyncio.run_coroutine_threadsafe(
+            create_client(session_file, api_id, api_hash, loop), loop
+        )
         client = future.result(timeout=10)
         context.user_data['client'] = client
         context.user_data['session_file'] = session_file
+        context.user_data['loop'] = loop
+        context.user_data['thread'] = thread
         
-        future = asyncio.run_coroutine_threadsafe(async_connect_and_check(client, phone), async_loop)
+        future = asyncio.run_coroutine_threadsafe(async_connect_and_check(client, phone), loop)
         result = future.result(timeout=30)
         
         if result == "already_authorized":
-            username = asyncio.run_coroutine_threadsafe(get_username_from_phone(client, phone), async_loop).result()
+            username = asyncio.run_coroutine_threadsafe(get_username_from_phone(client, phone), loop).result()
             with db_lock:
                 cursor.execute("UPDATE userbots SET username = ? WHERE phone_number = ?", (username, phone))
                 db.commit()
             display_name = f"@{username}" if username else f"{phone} (no username set)"
             update.message.reply_text(f"Userbot {display_name} is already authorized.")
-            asyncio.run_coroutine_threadsafe(client.disconnect(), async_loop).result()
+            asyncio.run_coroutine_threadsafe(client.disconnect(), loop).result()
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5)
             context.user_data.clear()
             return admin_panel(update, context)
         else:
@@ -1381,7 +1403,7 @@ def get_api_hash(update: Update, context):
 def get_code(update: Update, context):
     try:
         code = update.message.text.strip()
-        required_keys = ['client', 'phone', 'api_id', 'api_hash', 'session_file']
+        required_keys = ['client', 'phone', 'loop']
         missing = [key for key in required_keys if key not in context.user_data]
         if missing:
             update.message.reply_text(f"Error: Missing data ({', '.join(missing)}). Please start over with /admin.")
@@ -1389,12 +1411,13 @@ def get_code(update: Update, context):
         
         client = context.user_data['client']
         phone = context.user_data['phone']
+        loop = context.user_data['loop']
 
-        future = asyncio.run_coroutine_threadsafe(async_sign_in(client, phone, code), async_loop)
+        future = asyncio.run_coroutine_threadsafe(async_sign_in(client, phone, code), loop)
         future.result(timeout=60)
         
-        if asyncio.run_coroutine_threadsafe(client.is_user_authorized(), async_loop).result():
-            username = asyncio.run_coroutine_threadsafe(get_username_from_phone(client, phone), async_loop).result()
+        if asyncio.run_coroutine_threadsafe(client.is_user_authorized(), loop).result():
+            username = asyncio.run_coroutine_threadsafe(get_username_from_phone(client, phone), loop).result()
             with db_lock:
                 cursor.execute("INSERT INTO userbots (phone_number, session_file, status, api_id, api_hash, username) VALUES (?, ?, 'active', ?, ?, ?)",
                                (phone, context.user_data['session_file'], context.user_data['api_id'], context.user_data['api_hash'], username))
@@ -1412,8 +1435,10 @@ def get_code(update: Update, context):
         log_event("Get Code Error", f"Phone: {phone}, Error: {e}")
         update.message.reply_text(f"Error: {e}. Please try again.")
     finally:
-        if 'client' in context.user_data:
-            asyncio.run_coroutine_threadsafe(async_disconnect(context.user_data['client']), async_loop).result()
+        if 'client' in context.user_data and 'loop' in context.user_data:
+            asyncio.run_coroutine_threadsafe(async_disconnect(context.user_data['client']), context.user_data['loop']).result()
+            context.user_data['loop'].call_soon_threadsafe(context.user_data['loop'].stop)
+            context.user_data['thread'].join(timeout=5)
         context.user_data.clear()
         return admin_panel(update, context)
 
@@ -1425,10 +1450,11 @@ def get_password(update: Update, context):
         api_id = context.user_data['api_id']
         api_hash = context.user_data['api_hash']
         session_file = context.user_data['session_file']
-        future = asyncio.run_coroutine_threadsafe(async_sign_in_with_password(client, password), async_loop)
+        loop = context.user_data['loop']
+        future = asyncio.run_coroutine_threadsafe(async_sign_in_with_password(client, password), loop)
         future.result(timeout=60)
-        if asyncio.run_coroutine_threadsafe(client.is_user_authorized(), async_loop).result():
-            username = asyncio.run_coroutine_threadsafe(get_username_from_phone(client, phone), async_loop).result()
+        if asyncio.run_coroutine_threadsafe(client.is_user_authorized(), loop).result():
+            username = asyncio.run_coroutine_threadsafe(get_username_from_phone(client, phone), loop).result()
             with db_lock:
                 cursor.execute("INSERT INTO userbots (phone_number, session_file, status, api_id, api_hash, username) VALUES (?, ?, 'active', ?, ?, ?)",
                                (phone, session_file, api_id, api_hash, username))
@@ -1443,8 +1469,10 @@ def get_password(update: Update, context):
         log_event("Get Password Error", f"Phone: {phone}, Error: {e}")
         update.message.reply_text(f"Error: {e}. Retry with /admin.")
     finally:
-        if 'client' in context.user_data:
-            asyncio.run_coroutine_threadsafe(async_disconnect(context.user_data['client']), async_loop).result()
+        if 'client' in context.user_data and 'loop' in context.user_data:
+            asyncio.run_coroutine_threadsafe(async_disconnect(context.user_data['client']), context.user_data['loop']).result()
+            context.user_data['loop'].call_soon_threadsafe(context.user_data['loop'].stop)
+            context.user_data['thread'].join(timeout=5)
         context.user_data.clear()
         return admin_panel(update, context)
 
@@ -1517,9 +1545,9 @@ def process_group_urls(update: Update, context):
         if not folder_id:
             update.message.reply_text("Folder ID not found. Please start over.")
             return admin_panel(update, context)
-        client, loop, lock = get_userbot_client(context.user_data.get('phone', ''))
+        client, loop, lock, _ = get_userbot_client(context.user_data.get('phone', ''))
         if not client:
-            client = TelegramClient('anon', API_ID, API_HASH)
+            client = TelegramClient('anon', API_ID, API_HASH, loop=loop)
         results = asyncio.run_coroutine_threadsafe(join_groups(client, urls, folder_id, '', str(user_id)), loop).result()
         message = "Join Results:\n"
         for url, (success, detail) in zip(urls, results):
@@ -1555,7 +1583,7 @@ def process_group_links(update: Update, context):
 
         results_summary = ""
         for phone in userbot_phones:
-            client, loop, lock = get_userbot_client(phone)
+            client, loop, lock, _ = get_userbot_client(phone)
             if not client:
                 results_summary += f"Failed to initialize userbot {phone}.\n"
                 continue
@@ -1586,7 +1614,7 @@ def process_primary_message_link(update: Update, context):
         if not phone:
             update.message.reply_text("Userbot not selected. Please start over.")
             return ConversationHandler.END
-        client, loop, lock = get_userbot_client(phone)
+        client, loop, lock, _ = get_userbot_client(phone)
         if not client:
             update.message.reply_text(f"Failed to initialize userbot {phone}.")
             return ConversationHandler.END
@@ -1621,7 +1649,7 @@ def process_fallback_message_link(update: Update, context):
         if text.lower() == 'skip':
             task_config['fallback_message_link'] = None
         else:
-            client, loop, lock = get_userbot_client(phone)
+            client, loop, lock, _ = get_userbot_client(phone)
             if not client:
                 update.message.reply_text(f"Failed to initialize userbot {phone}.")
                 return ConversationHandler.END
@@ -1814,13 +1842,6 @@ def process_add_userbots_count(update: Update, context):
         update.message.reply_text(f"Error: {str(e)}. Please try again.")
         return WAITING_FOR_ADD_USERBOTS_COUNT
 
-# Async loop for background tasks
-async_loop = asyncio.new_event_loop()
-def run_async_loop():
-    asyncio.set_event_loop(async_loop)
-    async_loop.run_forever()
-threading.Thread(target=run_async_loop, daemon=True).start()
-
 # Register handlers
 conv_handler = ConversationHandler(
     entry_points=[
@@ -1874,51 +1895,61 @@ async def check_tasks():
                     continue
                 if last_run and (current_time - last_run < interval * 60):
                     continue
-                client, loop, lock = get_userbot_client(phone)
+                client, loop, lock, _ = get_userbot_client(phone)
                 if not client:
                     log_event("Task Error", f"Phone: {phone}, Error: Client not initialized")
                     continue
-                async with lock:
-                    await client.start()
-                    try:
-                        if send_to_all:
-                            dialogs = await client.get_dialogs()
-                            target_groups = [dialog.entity for dialog in dialogs if dialog.is_group]
-                        else:
-                            with db_lock:
-                                cursor.execute("SELECT group_id FROM target_groups WHERE folder_id = ?", (folder_id,))
-                                group_ids = [row[0] for row in cursor.fetchall()]
-                            target_groups = [PeerChannel(gid) for gid in group_ids]
-                        if not target_groups:
-                            continue
-                        chat, message_id = await get_message_from_link(client, message_link)
-                        success_count = 0
-                        for target in target_groups:
-                            try:
-                                await client.forward_messages(target, message_id, chat)
-                                success_count += 1
-                            except FloodWaitError as e:
-                                await asyncio.sleep(e.seconds)
-                            except ChatSendMediaForbiddenError:
-                                if fallback_message_link:
-                                    chat_fb, msg_id_fb = await get_message_from_link(client, fallback_message_link)
-                                    await client.forward_messages(target, msg_id_fb, chat_fb)
+                
+                async def execute_task():
+                    async with lock:
+                        await client.start()
+                        try:
+                            if send_to_all:
+                                dialogs = await client.get_dialogs()
+                                target_groups = [dialog.entity for dialog in dialogs if dialog.is_group]
+                            else:
+                                with db_lock:
+                                    cursor.execute("SELECT group_id FROM target_groups WHERE folder_id = ?", (folder_id,))
+                                    group_ids = [row[0] for row in cursor.fetchall()]
+                                target_groups = [PeerChannel(gid) for gid in group_ids]
+                            if not target_groups:
+                                return 0
+                            chat, message_id = await get_message_from_link(client, message_link)
+                            success_count = 0
+                            for target in target_groups:
+                                try:
+                                    await client.forward_messages(target, message_id, chat)
                                     success_count += 1
-                            except Exception as e:
-                                log_event("Forward Error", f"Phone: {phone}, Target: {target}, Error: {e}")
-                        with db_lock:
-                            cursor.execute("UPDATE userbot_settings SET last_run = ? WHERE client_id = ? AND userbot_phone = ?", (current_time, client_id, phone))
-                            cursor.execute("UPDATE clients SET total_messages_sent = total_messages_sent + ?, groups_reached = groups_reached + ? WHERE user_id = ?", (success_count, len(target_groups), client_id))
-                            db.commit()
-                        log_event("Task Executed", f"Phone: {phone}, Messages Sent: {success_count}, Groups: {len(target_groups)}")
-                    finally:
-                        await client.disconnect()
+                                except FloodWaitError as e:
+                                    await asyncio.sleep(e.seconds)
+                                except ChatSendMediaForbiddenError:
+                                    if fallback_message_link:
+                                        chat_fb, msg_id_fb = await get_message_from_link(client, fallback_message_link)
+                                        await client.forward_messages(target, msg_id_fb, chat_fb)
+                                        success_count += 1
+                                except Exception as e:
+                                    log_event("Forward Error", f"Phone: {phone}, Target: {target}, Error: {e}")
+                            with db_lock:
+                                cursor.execute("UPDATE userbot_settings SET last_run = ? WHERE client_id = ? AND userbot_phone = ?", (current_time, client_id, phone))
+                                cursor.execute("UPDATE clients SET total_messages_sent = total_messages_sent + ?, groups_reached = groups_reached + ? WHERE user_id = ?", (success_count, len(target_groups), client_id))
+                                db.commit()
+                            log_event("Task Executed", f"Phone: {phone}, Messages Sent: {success_count}, Groups: {len(target_groups)}")
+                            return success_count
+                        finally:
+                            await client.disconnect()
+
+                asyncio.run_coroutine_threadsafe(execute_task(), loop).result()
         except Exception as e:
             log_event("Task Check Error", f"Error: {e}")
         await asyncio.sleep(CHECK_TASKS_INTERVAL)
 
-# Start the background task
-asyncio.run_coroutine_threadsafe(check_tasks(), async_loop)
+# Async loop for background tasks
+async_loop = asyncio.new_event_loop()
+def run_async_loop():
+    asyncio.set_event_loop(async_loop)
+    asyncio.run_coroutine_threadsafe(check_tasks(), async_loop)
+    async_loop.run_forever()
+threading.Thread(target=run_async_loop, daemon=True).start()
 
 # Start the bot
 if __name__ == "__main__":
